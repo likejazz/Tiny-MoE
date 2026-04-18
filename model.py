@@ -318,19 +318,15 @@ class TransformerBlock(nn.Module):
         self.ls2 = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
-        def custom_forward(module):
-            def forward(*inputs):
-                return module(*inputs)
-            return forward
 
         residual = x
         x = self.norm1(x)
-        x = checkpoint(custom_forward(self.mla), x, position_ids, use_reentrant=False)
+        x = self.mla(x, position_ids)
         x = residual + self.ls1 * x
 
         residual = x
         x = self.norm2(x)
-        moe_out, aux_loss, z_loss = checkpoint(custom_forward(self.moe), x, use_reentrant=False)
+        moe_out, aux_loss, z_loss = self.moe(x)
         x = residual + self.ls2 * moe_out
         return x, aux_loss, z_loss
 

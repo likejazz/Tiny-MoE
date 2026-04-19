@@ -9,6 +9,7 @@ from datasets import load_dataset, interleave_datasets
 from torch.utils.data import IterableDataset
 import torch
 from transformers import AutoTokenizer
+from accelerate import Accelerator
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer.pad_token = tokenizer.eos_token
@@ -71,7 +72,14 @@ class PackedStreamingDataset(IterableDataset):
         self.tokens_yielded = 0
 
     def __iter__(self):
-        for example in self.dataset:
+        accelerator = Accelerator()
+        
+        sharded_dataset = self.dataset.shard(
+            num_shards=accelerator.num_processes, 
+            index=accelerator.process_index
+        )
+        for example in sharded_dataset:
+
             
             text = (example.get("text") or 
                     example.get("content") or 
@@ -83,21 +91,9 @@ class PackedStreamingDataset(IterableDataset):
                 truncation=False,
                 add_special_tokens=False
             )["input_ids"]
+            tokens.append(self.tokenizer.eos_token_id)
             
             self.token_buffer.extend(tokens)
-            
-            if len(self.token_buffer) > (self.max_seq_len * 80):
-                while len(self.token_buffer) >= self.max_seq_len:
-                    chunk = self.token_buffer[:self.max_seq_len]
-                    input_ids = torch.tensor(chunk, dtype=torch.long)
-                    position_ids = torch.arange(self.max_seq_len, dtype=torch.long)
-                    
-                    yield {"input_ids": input_ids, "position_ids": position_ids, "labels": input_ids}
-                    
-                    self.token_buffer = self.token_buffer[self.max_seq_len:]
-                    self.tokens_yielded += self.max_seq_len
-            
-            
             
             while len(self.token_buffer) >= self.max_seq_len:
                 chunk = self.token_buffer[:self.max_seq_len]
@@ -108,6 +104,6 @@ class PackedStreamingDataset(IterableDataset):
                 
                 self.token_buffer = self.token_buffer[self.max_seq_len:]
                 self.tokens_yielded += self.max_seq_len
-                
-                if self.tokens_yielded >= self.total_tokens:
-                    return
+            
+
+ 

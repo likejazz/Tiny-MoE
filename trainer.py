@@ -8,6 +8,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from accelerate import Accelerator,DistributedDataParallelKwargs
 from tqdm import tqdm
+import bitsandbytes as bnb
 from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login
 from model import Transformer, ModelConfig
@@ -37,15 +38,19 @@ Hardware & Backend Initialization:
 # Networking Workarounds (fixes 'NCCL timeout' or 'P2P' errors)
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
+
 # Memory Management (prevents OOM by managing fragmented chunks)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
+
 # Backend & Logging Stability
 os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1"
 os.environ["WANDB_START_METHOD"] = "thread"
+
 # Attention Kernel Selection (Flash Attention > Memory Efficient > Math)
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)   
+
 # Tensor Core Optimization (Balances speed and numerical precision)
 torch.set_float32_matmul_precision('high')
 
@@ -60,6 +65,7 @@ class TrainConfig:
         grad_clip (float): Maximum norm for gradient clipping to prevent explosions.
         num_train_steps (int): Total number of iterations to train for.
         warmup_steps (int): Number of steps for the initial linear LR ramp-up.
+        optimizer_type (str): Sets the Optimizer type (PagedAdamW | AdamW) default for AdamW else PagedAdamW.
         
         micro_batch_size (int): Number of samples per GPU per forward pass.
         grad_accum_steps (int): Number of steps to accumulate gradients before updating.
@@ -86,8 +92,9 @@ class TrainConfig:
     weight_decay = 0.1
     betas = (0.9, 0.95)
     grad_clip = 1.0
-    num_train_steps = 7630
-    warmup_steps = 760
+    num_train_steps = 6104
+    warmup_steps = 610
+    optimizer_type='default'
 
     # Batch / Throughput
     micro_batch_size = 16
@@ -100,7 +107,7 @@ class TrainConfig:
     compile_type = "default"
 
     # Memory
-    activation_checkpointing = False
+    activation_checkpointing = True
 
     # MoE Stability
     router_aux_loss_coef = 0.01
@@ -109,7 +116,7 @@ class TrainConfig:
     top_k = 2
 
     # Logging
-    save_interval=100
+    save_interval=300
     save_best_model = False
     log_interval = 10
     out_dir = "/kaggle/working/checkpoints"
@@ -215,13 +222,21 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
             accelerator.print("Warning: Model doesn't support gradient checkpointing.")
 
     
-    optimizer =torch.optim.AdamW(
-    model.parameters(),
-    lr=cfg.lr,
-    betas=cfg.betas,
-    weight_decay=cfg.weight_decay,
-    fused=True
-    )
+    if cfg.optimizer_type == "default":
+        optimizer =torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        betas=cfg.betas,
+        weight_decay=cfg.weight_decay,
+        fused=True
+        )
+    else:
+        optimizer =bnb.optim.PagedAdamW8bit(
+        model.parameters(),
+        lr=cfg.lr,
+        betas=cfg.betas,
+        weight_decay=cfg.weight_decay
+        )
 
     
     model, optimizer, dataloader = accelerator.prepare(
@@ -311,6 +326,7 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                     
                 current_loss=accelerator.gather(loss).mean().item()
                 step_time = time.perf_counter() - step_start
+                tps = global_step_tokens / step_time
 
                 is_best=current_loss<best_loss
                 if is_best:
@@ -364,47 +380,72 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                 
                 if step % cfg.log_interval == 0:
                     accelerator.print(
-                        f"Step {step} | Loss: {current_loss:.4f} | Tokens: {tokens_seen:,} | LR: {lr:.2e}")
-                    
+                        f"Step {step} | Loss: {current_loss:.4f} | Tokens: {tokens_seen:,} | LR: {lr:.2e}"
+                    )
+                
                     log_data = {
                         "loss": current_loss,
                         "best_loss": best_loss,
                         "lr": lr,
-                        "tokens_seen":tokens_seen,
+                        "tokens_seen": tokens_seen,
                         "step": step,
                         "best_step": best_step,
                         "step_time": step_time,
+                        "tps": tps,
                         "peak_Vram_gb": torch.cuda.max_memory_allocated() / 1e9,
                     }
+                
 
-                    
-                    if hasattr(outputs, 'aux_loss') and outputs.aux_loss is not None:
-                        raw_aux = outputs.aux_loss
-                        log_data["aux_loss"] = accelerator.gather(raw_aux).mean().item() if isinstance(raw_aux, torch.Tensor) else raw_aux
+                    if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None:
+                        raw_aux = outputs.aux_loss.detach()
+                        log_data["aux_loss"] = accelerator.gather(raw_aux).mean().item()
+                
+                    if hasattr(outputs, "z_loss") and outputs.z_loss is not None:
+                        raw_z = outputs.z_loss.detach()
+                        log_data["z_loss"] = accelerator.gather(raw_z).mean().item()
+                
 
-                    if hasattr(outputs, 'z_loss') and outputs.z_loss is not None:
-                        raw_z = outputs.z_loss
-                        log_data["z_loss"] = accelerator.gather(raw_z).mean().item() if isinstance(raw_z, torch.Tensor) else raw_z
+                    if hasattr(outputs, "router_logits") and outputs.router_logits is not None:
+                
+                        logits = outputs.router_logits.detach()
+                
 
-                    
-                    if hasattr(outputs, 'router_logits') and outputs.router_logits is not None:
+                        topk_indices = torch.topk(
+                            logits, cfg.num_experts_per_token, dim=-1
+                        ).indices
+                
+                        chosen_experts = topk_indices.reshape(-1)
+                
 
-                        logits = outputs.router_logits
-                        
+                        unique_experts = torch.unique(chosen_experts)
+                        utilization = unique_experts.numel() / cfg.num_experts
+                
+                        util_tensor = torch.tensor(utilization, device=logits.device)
+                        log_data["router/utilization_pct"] = (
+                            accelerator.gather(util_tensor).mean().item()
+                        )
+                
 
-                        chosen_experts = torch.argmax(logits, dim=-1)
-                        
+                        counts = torch.bincount(
+                            chosen_experts, minlength=cfg.num_experts
+                        ).float()
+                
+                        load = counts / (counts.sum() + 1e-9)
+                
+                        log_data["router/load_std"] = load.std().item()
+                        log_data["router/load_max"] = load.max().item()
+                        log_data["router/load_min"] = load.min().item()
+                
 
-                        unique_experts_used = torch.unique(chosen_experts)
-                        
-    
-                        utilization = len(unique_experts_used) / config.num_experts
-   
-                        avg_util = accelerator.reduce(torch.tensor(utilization, device=device), reduction="mean").item()
-                        log_data["router/utilization_pct"] = avg_util
-                    
-    
+                        entropy = -(load * (load + 1e-9).log()).sum()
+                        log_data["router/entropy"] = entropy.item()
+
+                        probs = torch.softmax(logits, dim=-1)
+                        confidence = probs.max(dim=-1).values.mean()
+                        log_data["router/confidence"] = confidence.item()
+                
                     accelerator.log(log_data, step=step)
+                    torch.cuda.reset_peak_memory_stats(device)
 
     
                     

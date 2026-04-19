@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
 from torch.utils.checkpoint import checkpoint
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 
 
 
@@ -56,7 +56,7 @@ class ModelConfig:
     # MoE
     num_experts: int = 4
     num_experts_per_token: int = 1
-    moe_intermediate_size: int = 512
+    moe_intermediate_size: int = 1024
 
 
 
@@ -184,7 +184,7 @@ class MLA(nn.Module):
         def sdpa_func(q_in, k_in, v_in):
             return F.scaled_dot_product_attention(q_in, k_in, v_in, is_causal=True, scale=self.scale)
 
-        attn_output = checkpoint(sdpa_func, q, k, v, use_reentrant=False)
+        attn_output = sdpa_func(q, k, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.head_dim)
         return self.w_o(attn_output)
 
@@ -239,58 +239,82 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.Tensor):
         bsz, seq_len, hidden = x.shape
-        x_flat = x.view(-1, hidden)
+        x_flat = x.reshape(-1, hidden)  
         N = x_flat.shape[0]
 
-        router_logits = self.router(x_flat)                     
-        router_probs = F.softmax(router_logits, dim=-1)         
-        
-        z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+
+        router_logits = self.router(x_flat)
+        router_probs = F.softmax(router_logits, dim=-1)
+
+
+        z_loss = 1e-3 * torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+
 
         topk_weights, topk_indices = torch.topk(
             router_probs, self.num_experts_per_token, dim=-1
-        )  
+        )
 
-        importance = router_probs.sum(0).detach()               
-        load = torch.zeros_like(importance)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
 
-        for i in range(self.num_experts):
-            load[i] = (topk_indices == i).sum()
 
-        load = load.float()
+        importance = router_probs.mean(dim=0)        
+        load = router_probs.sum(dim=0)               
+
         load = load / (load.sum() + 1e-6)
-        importance = importance / (importance.sum() + 1e-6)
 
         aux_loss = torch.sum(importance * load) * self.num_experts
 
-
-        output_flat = torch.zeros_like(x_flat)
-
         token_indices = torch.arange(N, device=x.device).unsqueeze(1).expand_as(topk_indices)
 
-        for expert_idx in range(self.num_experts):
-            mask = (topk_indices == expert_idx)
+        flat_experts = topk_indices.reshape(-1)
+        flat_tokens = token_indices.reshape(-1)
+        flat_gates = topk_weights.reshape(-1)
 
-            if not mask.any():
+        sorted_idx = torch.argsort(flat_experts)
+        inverse_idx = torch.argsort(sorted_idx)
+
+        flat_experts = flat_experts[sorted_idx]
+        flat_tokens = flat_tokens[sorted_idx]
+        flat_gates = flat_gates[sorted_idx]
+
+        sorted_inputs = x_flat[flat_tokens]
+
+
+        expert_counts = torch.bincount(
+            flat_experts,
+            minlength=self.num_experts
+        )
+
+        sorted_outputs = torch.empty_like(sorted_inputs)
+
+        start = 0
+        for expert_idx in range(self.num_experts):
+            count = expert_counts[expert_idx].item()
+
+            if count == 0:
                 continue
 
-            selected_tokens = token_indices[mask]
-            gate = topk_weights[mask].unsqueeze(-1)
+            end = start + count
 
-            expert_in = x_flat[selected_tokens]
+            expert_in = sorted_inputs[start:end]
             expert_out = self.experts[expert_idx](expert_in)
 
-            output_flat.index_add_(
-                0,
-                selected_tokens,
-                (gate * expert_out).to(output_flat.dtype)
-            )
+
+            sorted_outputs[start:end] = expert_out.to(sorted_outputs.dtype)
+
+            start = end
+
+        unsorted_outputs = sorted_outputs[inverse_idx]
+
+        unsorted_outputs = unsorted_outputs.view(
+            N, self.num_experts_per_token, hidden
+        )
+
+        output_flat = (unsorted_outputs * topk_weights.unsqueeze(-1)).sum(dim=1)
 
         output = output_flat.view(bsz, seq_len, hidden)
 
         return output, aux_loss, z_loss
-        
-
 class TransformerBlock(nn.Module):
     """
     A single Transformer layer combining MLA and MoE.

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
 from torch.utils.checkpoint import checkpoint
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 
 
 
@@ -38,8 +38,8 @@ class ModelConfig:
         moe_intermediate_size (int): The hidden dimension size inside each individual expert.
     """
     vocab_size: int = 32000
-    hidden_size: int = 640
-    num_layers: int = 8
+    hidden_size: int = 512
+    num_layers: int = 12
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
     max_seq_len: int = 1024
@@ -48,15 +48,15 @@ class ModelConfig:
     rope_theta: float = 10000.0
 
     # MLA
-    num_attention_heads: int = 10
-    kv_lora_rank: int = 160
-    qk_nope_dim: int = 256
-    qk_rope_dim: int = 64
+    num_attention_heads: int = 8
+    kv_lora_rank: int = 128
+    qk_nope_dim: int = 32
+    qk_rope_dim: int = 32
 
     # MoE
-    num_experts: int = 4
-    num_experts_per_token: int = 1
-    moe_intermediate_size: int = 1280
+    num_experts: int = 8
+    num_experts_per_token: int = 2
+    moe_intermediate_size: int = 1024
 
 
 
@@ -149,40 +149,46 @@ class MLA(nn.Module):
         self.head_dim = self.qk_nope_dim + self.qk_rope_dim
 
         self.w_dkv = nn.Linear(self.hidden_size, self.kv_lora_rank, bias=False)
-        self.w_uk = nn.Linear(self.kv_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.w_uv = nn.Linear(self.kv_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.w_dq = nn.Linear(self.hidden_size, self.kv_lora_rank, bias=False)
-        self.w_uq = nn.Linear(self.kv_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.w_qr = nn.Linear(self.kv_lora_rank, self.num_heads * self.qk_rope_dim, bias=False)
+        self.w_ukv = nn.Linear(self.kv_lora_rank,self.num_heads * self.head_dim * 2,  bias=False )
+        self.w_uq_qr = nn.Linear(self.kv_lora_rank,self.num_heads * self.head_dim + self.num_heads * self.qk_rope_dim,bias=False)
         self.w_kr = nn.Linear(self.hidden_size, self.qk_rope_dim, bias=False)
         self.w_o = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
         self.rope = RoPE(config)
-        self.scale = self.head_dim ** -0.5
 
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         bsz, seq_len, _ = x.shape
+
+
         c_kv = self.w_dkv(x)
-        k_nope = self.w_uk(c_kv).view(bsz, seq_len, self.num_heads, self.head_dim)
-        v = self.w_uv(c_kv).view(bsz, seq_len, self.num_heads, self.head_dim)
+        kv = self.w_ukv(c_kv)  
+        kv = kv.view(bsz, seq_len, self.num_heads, 2 * self.head_dim)
+        k_nope, v = kv.split(self.head_dim, dim=-1)
+
 
         c_q = self.w_dq(x)
-        q_nope = self.w_uq(c_q).view(bsz, seq_len, self.num_heads, self.head_dim)
-        q_rope = self.w_qr(c_q).view(bsz, seq_len, self.num_heads, self.qk_rope_dim)
+        q_proj = self.w_uq_qr(c_q)  
+        q_proj = q_proj.view(bsz, seq_len, self.num_heads, self.head_dim + self.qk_rope_dim)
+        q_nope, q_rope = q_proj.split([self.head_dim, self.qk_rope_dim], dim=-1)
+
         k_rope = self.w_kr(x).view(bsz, seq_len, 1, self.qk_rope_dim)
 
         q_rope = self.rope(q_rope, position_ids)
         k_rope = self.rope(k_rope, position_ids)
 
         q = torch.cat([q_nope, q_rope], dim=-1)
-        k = torch.cat([k_nope, k_rope.expand(-1, -1, self.num_heads, -1)], dim=-1)
+        k_rope = k_rope.repeat(1, 1, self.num_heads, 1)
+        k = torch.cat([k_nope, k_rope], dim=-1)
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
         def sdpa_func(q_in, k_in, v_in):
-            return F.scaled_dot_product_attention(q_in, k_in, v_in, is_causal=True, scale=self.scale)
+            return F.scaled_dot_product_attention(
+                q_in, k_in, v_in,
+                is_causal=True
+            )
 
         attn_output = sdpa_func(q, k, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.head_dim)
@@ -314,7 +320,7 @@ class MoE(nn.Module):
 
         output = output_flat.view(bsz, seq_len, hidden)
 
-        return output, aux_loss, z_loss
+        return output, aux_loss, z_loss, router_logits
 
 class TransformerBlock(nn.Module):
     """
@@ -351,9 +357,9 @@ class TransformerBlock(nn.Module):
 
         residual = x
         x = self.norm2(x)
-        moe_out, aux_loss, z_loss = self.moe(x)
+        moe_out, aux_loss, z_loss,router_logits = self.moe(x)
         x = residual + self.ls2 * moe_out
-        return x, aux_loss, z_loss
+        return x, aux_loss, z_loss,router_logits
 
 class Transformer(nn.Module):
     """
@@ -402,24 +408,27 @@ class Transformer(nn.Module):
 
      
         
-        total_aux_loss = 0.0
-        total_z_loss = 0.0
+        total_aux_loss = torch.tensor(0.0, device=x.device)
+        total_z_loss = torch.tensor(0.0, device=x.device)
+        last_router_logits = None
         use_checkpoint=self.training
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x, aux_loss, z_loss = checkpoint(layer, x, position_ids, use_reentrant=False)
+                x, aux_loss, z_loss,router_logits = checkpoint(layer, x, position_ids, use_reentrant=False)
             else:
-                x, aux_loss, z_loss = layer(x, position_ids)
+                x, aux_loss, z_loss,router_logits = layer(x, position_ids)
 
-
+            
+            last_router_logits = router_logits
             total_aux_loss += aux_loss
             total_z_loss += z_loss
 
         x=self.norm(x)
         logits=self.lm_head(x)
         
-        return{
-            "logits":logits,
-            "aux_loss":total_aux_loss,
-            "z_loss":total_z_loss
+        return {
+            "logits": logits,
+            "aux_loss": total_aux_loss,
+            "z_loss": total_z_loss,
+            "router_logits": last_router_logits
         }

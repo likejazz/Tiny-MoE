@@ -14,18 +14,25 @@ from huggingface_hub import login
 from model import Transformer, ModelConfig
 from data import PackedStreamingDataset
 from transformers import AutoTokenizer
+import shutil
 
 #  Authentication
 from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login
 import wandb
+
 user_secrets = UserSecretsClient()
 hf_token = user_secrets.get_secret("HF_TOKEN") 
 login(token=hf_token)
 
 wandb_key = user_secrets.get_secret("WANDB_API_KEY")
 
-    
+
+
+
+
+
+
 
 
 
@@ -109,15 +116,43 @@ class TrainConfig:
     router_aux_loss_coef = 0.01
     router_z_loss_coef = 1e-4
     capacity_factor = 1.1
-    top_k = 1
+    top_k = 2
 
     # Logging
     save_interval=300
     save_best_model = False
     log_interval = 10
     out_dir = "/kaggle/working/checkpoints"
-    
 # Helper Functions 
+def prepare_checkpoint_from_dataset(cfg: TrainConfig):
+
+    SRC_BASE = "/kaggle/input/datasets/abdelrhmanebied/model-checkpoint/checkpoints/regular"
+    DST_BASE = os.path.join(cfg.out_dir, "regular")
+    os.makedirs(DST_BASE, exist_ok=True)
+
+    if not os.path.exists(SRC_BASE):
+        print("No dataset checkpoint found, starting fresh.")
+        return None
+
+    subdirs = [d for d in os.listdir(SRC_BASE) if d.startswith("step_")]
+    if not subdirs:
+        print("No checkpoints inside dataset.")
+        return None
+
+    latest = max(subdirs, key=lambda x: int(x.split("_")[-1]))
+
+    SRC_PATH = os.path.join(SRC_BASE, latest)
+    DST_PATH = os.path.join(DST_BASE, latest)
+
+    if not os.path.exists(DST_PATH):
+        print(f"Copying {latest} → working dir...")
+        shutil.copytree(SRC_PATH, DST_PATH, dirs_exist_ok=True)
+    else:
+        print(f"{latest} already exists in working dir")
+
+    print(f"Checkpoint ready at: {DST_PATH}")
+    return DST_PATH
+
 def get_lr(step, cfg: TrainConfig):
     """
     Calculates the learning rate for a specific training step.
@@ -240,7 +275,8 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
     if cfg.compile_model:
         accelerator.print("Compiling model...")
         model = torch.compile(model,mode=cfg.compile_type)
-
+        
+    prepare_checkpoint_from_dataset(cfg)
     best_loss=float("inf")
     best_step=0
     tokens_seen=0
@@ -424,20 +460,21 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                     }
                 
 
-                    if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None:
-                        raw_aux = outputs.aux_loss.detach()
+                    if "aux_loss" in outputs and outputs["aux_loss"] is not None:
+                        raw_aux = outputs["aux_loss"].detach()
                         log_data["aux_loss"] = accelerator.gather(raw_aux).mean().item()
-                
-                    if hasattr(outputs, "z_loss") and outputs.z_loss is not None:
-                        raw_z = outputs.z_loss.detach()
+                    
+                    if "z_loss" in outputs and outputs["z_loss"] is not None:
+                        raw_z = outputs["z_loss"].detach()
                         log_data["z_loss"] = accelerator.gather(raw_z).mean().item()
-                
-
-                    if hasattr(outputs, "router_logits") and outputs.router_logits is not None:
-                
-                        logits = outputs.router_logits.detach()
-                        num_experts = model.module.config.num_experts if hasattr(model, "module") else model.config.num_experts
-                        top_k = model.module.num_experts_per_token if hasattr(model, "module") else model.num_experts_per_token
+                    
+                    if "router_logits" in outputs and outputs["router_logits"] is not None:
+                        logits = accelerator.gather(outputs["router_logits"]).detach()
+                        
+                        real_model = model.module if hasattr(model, "module") else model
+                        
+                        num_experts = real_model.config.num_experts
+                        top_k = real_model.config.num_experts_per_token
                         topk_indices = torch.topk(
                             logits, top_k, dim=-1
                         ).indices
@@ -468,8 +505,9 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                         probs = torch.softmax(logits, dim=-1)
                         confidence = probs.max(dim=-1).values.mean()
                         log_data["router/confidence"] = confidence.item()
-                
-                    accelerator.log(log_data, step=step)
+                        
+                    if accelerator.is_main_process:
+                     accelerator.log(log_data, step=step)
                     torch.cuda.reset_peak_memory_stats(device)
 
     

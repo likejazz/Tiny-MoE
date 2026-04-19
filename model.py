@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
 from torch.utils.checkpoint import checkpoint
-
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
 
@@ -38,7 +38,7 @@ class ModelConfig:
         moe_intermediate_size (int): The hidden dimension size inside each individual expert.
     """
     vocab_size: int = 32000
-    hidden_size: int = 512
+    hidden_size: int = 640
     num_layers: int = 8
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
@@ -48,15 +48,15 @@ class ModelConfig:
     rope_theta: float = 10000.0
 
     # MLA
-    num_attention_heads: int = 8
-    kv_lora_rank: int = 128
+    num_attention_heads: int = 10
+    kv_lora_rank: int = 160
     qk_nope_dim: int = 256
     qk_rope_dim: int = 64
 
     # MoE
     num_experts: int = 4
     num_experts_per_token: int = 1
-    moe_intermediate_size: int = 1024
+    moe_intermediate_size: int = 1280
 
 
 
@@ -289,9 +289,9 @@ class MoE(nn.Module):
 
         start = 0
         for expert_idx in range(self.num_experts):
-            count = expert_counts[expert_idx].item()
+            count = expert_counts[expert_idx]
 
-            if count == 0:
+            if count <= 0:
                 continue
 
             end = start + count
@@ -315,6 +315,7 @@ class MoE(nn.Module):
         output = output_flat.view(bsz, seq_len, hidden)
 
         return output, aux_loss, z_loss
+
 class TransformerBlock(nn.Module):
     """
     A single Transformer layer combining MLA and MoE.

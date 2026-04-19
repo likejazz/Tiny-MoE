@@ -38,19 +38,15 @@ Hardware & Backend Initialization:
 # Networking Workarounds (fixes 'NCCL timeout' or 'P2P' errors)
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
-
 # Memory Management (prevents OOM by managing fragmented chunks)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
-
 # Backend & Logging Stability
 os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1"
 os.environ["WANDB_START_METHOD"] = "thread"
-
 # Attention Kernel Selection (Flash Attention > Memory Efficient > Math)
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)   
-
 # Tensor Core Optimization (Balances speed and numerical precision)
 torch.set_float32_matmul_precision('high')
 
@@ -92,8 +88,8 @@ class TrainConfig:
     weight_decay = 0.1
     betas = (0.9, 0.95)
     grad_clip = 1.0
-    num_train_steps = 6104
-    warmup_steps = 610
+    num_train_steps = 61000
+    warmup_steps = 6100
     optimizer_type='default'
 
     # Batch / Throughput
@@ -113,7 +109,7 @@ class TrainConfig:
     router_aux_loss_coef = 0.01
     router_z_loss_coef = 1e-4
     capacity_factor = 1.1
-    top_k = 2
+    top_k = 1
 
     # Logging
     save_interval=300
@@ -139,7 +135,6 @@ def get_lr(step, cfg: TrainConfig):
         return cfg.lr * step / cfg.warmup_steps
     progress = (step - cfg.warmup_steps) / (cfg.num_train_steps - cfg.warmup_steps)
     return 0.5 * cfg.lr * (1 + math.cos(math.pi * progress))
-
 
 
 def compute_loss(outputs, targets, cfg: TrainConfig):
@@ -221,7 +216,6 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
         else:
             accelerator.print("Warning: Model doesn't support gradient checkpointing.")
 
-    
     if cfg.optimizer_type == "default":
         optimizer =torch.optim.AdamW(
         model.parameters(),
@@ -259,19 +253,49 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
     regular_ckpt_dir = os.path.join(cfg.out_dir, "regular")
     os.makedirs(regular_ckpt_dir, exist_ok=True)
     
-    resume_path=checkpoint_dir if os.path.exists(checkpoint_dir) else regular_ckpt_dir
-    if os.path.exists(resume_path) and os.path.exists(os.path.join(resume_path, "pytorch_model.bin")):
-        accelerator.print(f"Resuming from best checkpoint: {resume_path}")
+    def has_checkpoint(path):
+        return (
+            os.path.exists(os.path.join(path, "model.safetensors")) or
+            os.path.exists(os.path.join(path, "pytorch_model.bin"))
+        )
+
+    resume_path = None
+    
+
+    if has_checkpoint(checkpoint_dir):
+        resume_path = checkpoint_dir
+    
+
+    elif os.path.exists(regular_ckpt_dir):
+        subdirs = [
+            os.path.join(regular_ckpt_dir, d)
+            for d in os.listdir(regular_ckpt_dir)
+            if d.startswith("step_")
+        ]
+    
+        if subdirs:
+            latest = max(subdirs, key=lambda x: int(x.split("_")[-1]))
+            if has_checkpoint(latest):
+                resume_path = latest
+    
+
+    if resume_path:
+        accelerator.print(f"Resuming from: {resume_path}")
         accelerator.load_state(resume_path)
-        
-        
+    
         meta_path = os.path.join(resume_path, "metadata.pt")
         if os.path.exists(meta_path):
             meta = torch.load(meta_path, map_location="cpu")
+    
             step = meta["step"]
-            best_loss = meta["loss"]
             tokens_seen = meta["tokens_seen"]
-            accelerator.print(f"Resumed at step {step} | best_loss {best_loss:.4f}")
+    
+            best_step = meta.get("best_step", step)
+            best_loss = meta.get("best_loss", meta.get("loss", float("inf")))
+    
+            accelerator.print(
+                f"Resumed at step {step} | best_loss {best_loss:.4f}"
+            )
     else:
         accelerator.print("No checkpoint found — starting from scratch.")
     
@@ -342,31 +366,35 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                     if accelerator.is_main_process:
                         torch.save({
                             "step": step,
-                            "loss": best_loss,
+                            "best_step": best_step,
+                            "loss": current_loss,
+                            "best_loss": best_loss,
                             "tokens_seen": tokens_seen,  
                         }, os.path.join(checkpoint_dir, "metadata.pt"))
                         
                 if step % cfg.save_interval == 0:
-                    if is_best:
 
-                        accelerator.print(f"Step {step}: Loss improved to {best_loss:.4f}. Saving checkpoint...")
-                        
-                        
-                        accelerator.wait_for_everyone()
-                        
-                        
-                        save_path = os.path.join(regular_ckpt_dir, f"step_{step}")
-                        accelerator.save_state(save_path, safe_serialization=True)
-                        
-                        
-                        if accelerator.is_main_process:
-                            torch.save({
-                                "step": step,
-                                "loss": best_loss,
-                                "tokens_seen": tokens_seen, 
-                            }, os.path.join(save_path, "metadata.pt"))
-                    else:
-                        accelerator.print(f"ℹ️ Step {step}: ({current_loss:.4f}) did not beat {best_loss:.4f}  No save.")
+
+                    accelerator.print(f"Saving checkpoint at step {step}...")
+                    
+                    
+                    accelerator.wait_for_everyone()
+                    
+                    
+                    save_path = os.path.join(regular_ckpt_dir, f"step_{step}")
+                    accelerator.save_state(save_path, safe_serialization=True)
+                    
+                    
+                    if accelerator.is_main_process:
+                        torch.save({
+                            "step": step,
+                            "best_step": best_step,
+                            "loss": current_loss,
+                            "best_loss" : best_loss,
+                            "tokens_seen": tokens_seen, 
+                        }, os.path.join(save_path, "metadata.pt"))
+                        accelerator.print(f"✅ Checkpoint saved at {save_path}")
+                
                         
 
                 
@@ -408,26 +436,23 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                     if hasattr(outputs, "router_logits") and outputs.router_logits is not None:
                 
                         logits = outputs.router_logits.detach()
-                
-
+                        num_experts = model.module.config.num_experts if hasattr(model, "module") else model.config.num_experts
+                        top_k = model.module.num_experts_per_token if hasattr(model, "module") else model.num_experts_per_token
                         topk_indices = torch.topk(
-                            logits, cfg.num_experts_per_token, dim=-1
+                            logits, top_k, dim=-1
                         ).indices
                 
                         chosen_experts = topk_indices.reshape(-1)
                 
-
+                        
                         unique_experts = torch.unique(chosen_experts)
-                        utilization = unique_experts.numel() / cfg.num_experts
+                        utilization = unique_experts.numel() / num_experts
                 
-                        util_tensor = torch.tensor(utilization, device=logits.device)
-                        log_data["router/utilization_pct"] = (
-                            accelerator.gather(util_tensor).mean().item()
-                        )
-                
+
+                        log_data["router/utilization_pct"] = utilization
 
                         counts = torch.bincount(
-                            chosen_experts, minlength=cfg.num_experts
+                            chosen_experts, minlength=num_experts
                         ).float()
                 
                         load = counts / (counts.sum() + 1e-9)

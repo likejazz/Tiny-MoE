@@ -243,7 +243,7 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
 
 
 
-    local_val_loss = running_loss / cfg.num_eval_steps
+   
     val_loss = (running_loss / cfg.num_eval_steps).item()
     val_ppl = math.exp(min(val_loss, 20))
 
@@ -392,7 +392,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
             try:
                 batch = next(data_iter)
             except StopIteration:
-                data_iter = iter(dataloader)
+                data_iter = iter(train_dataloader)
                 batch = next(data_iter)
                 
             local_tokens = batch["input_ids"].numel()
@@ -433,6 +433,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                 tps = global_step_tokens / step_time
                 if step % cfg.eval_interval == 0:
                     val_loss, val_ppl = evaluate(model, val_dataloader, cfg, accelerator)
+                    accelerator.print("Evaluating Now...")
                     
                 is_best=current_loss<best_loss
                 if is_best:

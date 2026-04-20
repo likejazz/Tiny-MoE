@@ -6,10 +6,12 @@ hf_token = user_secrets.get_secret("HF_TOKEN")
 from huggingface_hub import login
 login(token=hf_token)
 from datasets import load_dataset, interleave_datasets
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset,Dataset
 import torch
 from transformers import AutoTokenizer
 from accelerate import Accelerator
+from itertools import islice
+
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer.pad_token = tokenizer.eos_token
@@ -33,10 +35,11 @@ class PackedStreamingDataset(IterableDataset):
             - 'position_ids' (torch.Tensor): Sequential indices from 0 to max_seq_len-1.
             - 'labels' (torch.Tensor): Same as input_ids (for causal language modeling).
     """
-    def __init__(self, config, tokenizer, total_tokens: int ):
+    def __init__(self, config, tokenizer, total_tokens: int,split : str, eval_samples : int ):
         self.tokenizer = tokenizer
         self.max_seq_len = config.max_seq_len   
         self.total_tokens = total_tokens
+        self.split=split
         
         # 60% Web
         ds_web = load_dataset(
@@ -62,23 +65,29 @@ class PackedStreamingDataset(IterableDataset):
         )
         
 
-        self.dataset = interleave_datasets(
+        raw_mixed = interleave_datasets(
             [ds_web, ds_code, ds_math],
             probabilities=[0.60, 0.25, 0.15],
             stopping_strategy="first_exhausted"
         )
-        
+        if split=="eval":
+            self.dataset = raw_mixed.take(eval_samples)
+        else:
+            self.dataset = raw_mixed.skip(eval_samples).shuffle(seed=3)
         self.token_buffer = []
         self.tokens_yielded = 0
 
     def __iter__(self):
-        accelerator = Accelerator()
-        
-        sharded_dataset = self.dataset.shard(
-            num_shards=accelerator.num_processes, 
-            index=accelerator.process_index
-        )
-        for example in sharded_dataset:
+        if self.split == "train":
+            accelerator = Accelerator()
+            
+            iterator = self.dataset.shard(
+                num_shards=accelerator.num_processes, 
+                index=accelerator.process_index
+            )
+        else:
+          iterator=self.dataset
+        for example in iterator:
 
             
             text = (example.get("text") or 
@@ -106,4 +115,5 @@ class PackedStreamingDataset(IterableDataset):
                 self.tokens_yielded += self.max_seq_len
             
 
- 
+
+

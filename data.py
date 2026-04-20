@@ -33,7 +33,7 @@ class PackedStreamingDataset(IterableDataset):
             - 'position_ids' (torch.Tensor): Sequential indices from 0 to max_seq_len-1.
             - 'labels' (torch.Tensor): Same as input_ids (for causal language modeling).
     """
-    def __init__(self, config, tokenizer, total_tokens: int = 20_000_000_00):
+    def __init__(self, config, tokenizer, total_tokens: int ):
         self.tokenizer = tokenizer
         self.max_seq_len = config.max_seq_len   
         self.total_tokens = total_tokens

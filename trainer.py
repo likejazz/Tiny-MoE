@@ -114,14 +114,16 @@ class TrainConfig:
 
     # MoE Stability
     router_aux_loss_coef = 0.01
-    router_z_loss_coef = 1e-4
+    router_z_loss_coef = 1e-3
     capacity_factor = 1.1
     top_k = 2
 
     # Logging
     save_interval=300
+    num_eval_steps = 25
+    eval_interval = 500
     save_best_model = False
-    log_interval = 10
+    log_interval = 20
     out_dir = "/kaggle/working/checkpoints"
 # Helper Functions 
 def prepare_checkpoint_from_dataset(cfg: TrainConfig):
@@ -206,8 +208,49 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
 
 
 
+def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
+    model.eval()
+    
+ 
+    data_iter = iter(val_dataloader)
+    
+    device = accelerator.device
+    running_loss = torch.tensor(0.0, device=device)
 
-def train(model,dataloader:DataLoader,cfg: TrainConfig):
+    with torch.inference_mode():
+   
+        for step, batch in enumerate(data_iter):
+            if step >= cfg.num_eval_steps:
+                break
+
+    
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            labels = batch.get("labels", input_ids).to(device, non_blocking=True)
+
+     
+            if "position_ids" in batch:
+                position_ids = batch["position_ids"]
+            else:
+ 
+                batch_size, seq_len = input_ids.shape
+                position_ids = torch.arange(seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size, -1)
+
+            outputs = model(input_ids, position_ids=position_ids)
+            loss = compute_loss(outputs, labels, cfg)
+            loss = accelerator.gather(loss).mean()
+            running_loss += loss
+
+
+
+
+    local_val_loss = running_loss / cfg.num_eval_steps
+    val_loss = (running_loss / cfg.num_eval_steps).item()
+    val_ppl = math.exp(min(val_loss, 20))
+
+    model.train()
+    return val_loss, val_ppl
+    
+def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: TrainConfig):
     """
     Main training loop utilizing HF Accelerator for distributed MoE training.
 
@@ -268,10 +311,10 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
         )
 
     
-    model, optimizer, dataloader = accelerator.prepare(
-        model, optimizer, dataloader
+    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader
     )
-    
+        
     if cfg.compile_model:
         accelerator.print("Compiling model...")
         model = torch.compile(model,mode=cfg.compile_type)
@@ -338,7 +381,7 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
     progress_bar = tqdm(total=cfg.num_train_steps,initial=step, disable=not accelerator.is_main_process)
     
     
-    data_iter = iter(dataloader)
+    data_iter = iter(train_dataloader)
 
     while step < cfg.num_train_steps:
         if cfg.compile_type == "reduce-overhead":
@@ -385,9 +428,12 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                     param_group["lr"] = lr
                     
                 current_loss=accelerator.gather(loss).mean().item()
+                perplexity = math.exp(min(current_loss, 20))
                 step_time = time.perf_counter() - step_start
                 tps = global_step_tokens / step_time
-
+                if step % cfg.eval_interval == 0:
+                    val_loss, val_ppl = evaluate(model, val_dataloader, cfg, accelerator)
+                    
                 is_best=current_loss<best_loss
                 if is_best:
                     best_loss=current_loss
@@ -429,7 +475,7 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                             "best_loss" : best_loss,
                             "tokens_seen": tokens_seen, 
                         }, os.path.join(save_path, "metadata.pt"))
-                        accelerator.print(f"✅ Checkpoint saved at {save_path}")
+                        accelerator.print(f" Checkpoint saved at {save_path}")
                 
                         
 
@@ -438,19 +484,21 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                     progress_bar.update(1)
                     progress_bar.set_postfix({
                         "loss": f"{current_loss:.4f}", 
-                        "sec/step": f"{step_time:.2f}"
+                        "sec/step": f"{step_time:.2f}",
+                        "Perplex" : f"{perplexity:.4f}",
                     }) 
                 
                 
                 if step % cfg.log_interval == 0:
                     accelerator.print(
-                        f"Step {step} | Loss: {current_loss:.4f} | Tokens: {tokens_seen:,} | LR: {lr:.2e}"
+                        f"Step {step} | Loss: {current_loss:.4f} | Tokens: {tokens_seen:,} | LR: {lr:.2e} | Perplexity : {perplexity:.4f}"
                     )
                 
                     log_data = {
                         "loss": current_loss,
                         "best_loss": best_loss,
                         "lr": lr,
+                        "perplexity":perplexity,
                         "tokens_seen": tokens_seen,
                         "step": step,
                         "best_step": best_step,
@@ -459,7 +507,9 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                         "peak_Vram_gb": torch.cuda.max_memory_allocated() / 1e9,
                     }
                 
-
+                    if step % cfg.eval_interval == 0:
+                        log_data["val_loss"] = val_loss
+                        log_data["val_ppl"] = val_ppl
                     if "aux_loss" in outputs and outputs["aux_loss"] is not None:
                         raw_aux = outputs["aux_loss"].detach()
                         log_data["aux_loss"] = accelerator.gather(raw_aux).mean().item()
@@ -493,10 +543,12 @@ def train(model,dataloader:DataLoader,cfg: TrainConfig):
                         ).float()
                 
                         load = counts / (counts.sum() + 1e-9)
+                        
                 
                         log_data["router/load_std"] = load.std().item()
                         log_data["router/load_max"] = load.max().item()
                         log_data["router/load_min"] = load.min().item()
+                        log_data["router/load_ratio"] = (load.max() / (load.min() + 1e-9)).item()
                 
 
                         entropy = -(load * (load + 1e-9).log()).sum()
@@ -527,12 +579,24 @@ if __name__ == "__main__":
     config = ModelConfig()
     model = Transformer(config)
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-    dataset = PackedStreamingDataset(config, tokenizer)
-    dataloader = DataLoader(dataset, 
+    train_dataset = PackedStreamingDataset(config, tokenizer,total_tokens=2_000_000_000)
+    train_dataloader = DataLoader(train_dataset, 
                             batch_size=cfg.micro_batch_size,
                             drop_last=True,
                             num_workers=2,
                             prefetch_factor=2,
                            persistent_workers=True,
                             pin_memory=True)
-    train(model, dataloader, cfg)
+    val_dataset = PackedStreamingDataset(config, 
+                                         tokenizer, 
+                                         total_tokens=10_000_000)
+    val_dataloader = DataLoader(
+                        val_dataset,
+                        batch_size=cfg.micro_batch_size,
+                        drop_last=True,
+                        num_workers=2,
+                        prefetch_factor=2,
+                        persistent_workers=True,
+                        pin_memory=True)
+                    
+    train(model, train_dataloader, val_dataloader, cfg)

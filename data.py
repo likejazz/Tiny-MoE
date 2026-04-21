@@ -20,21 +20,27 @@ class PackedStreamingDataset(IterableDataset):
     """
     An efficient streaming dataset that interleaves multiple sources and packs tokens.
 
-    This class handles the 'token packing' problem by maintaining a buffer of 
-    tokenized text, yielding full sequences of 'max_seq_len' to ensure 
-    zero-padding training.
+    This class mixes data from three major sources (Web, Code, and Math) using 
+    specified probabilities. It solves the 'padding' problem by concatenating 
+    tokenized text into a continuous stream and carving out perfectly sized 
+    chunks of 'max_seq_len'.
 
     Args:
-        config (ModelConfig): Configuration object containing 'max_seq_len'.
-        tokenizer (PreTrainedTokenizer): The tokenizer to convert text to IDs.
-        total_tokens (int): The hard limit for the number of tokens to yield.
+        config (ModelConfig): Configuration containing 'max_seq_len'.
+        tokenizer (PreTrainedTokenizer): The tokenizer used to process raw text.
+        total_tokens (int): The maximum number of tokens to process.
+        split (str): Either "train" or "eval"; determines if the dataset 
+                    shards for distributed training or skips/takes samples.
+        eval_samples (int): The number of samples reserved for the evaluation split.
 
     Yields:
         dict: A dictionary containing:
-            - 'input_ids' (torch.Tensor): Packed token IDs of length max_seq_len.
-            - 'position_ids' (torch.Tensor): Sequential indices from 0 to max_seq_len-1.
-            - 'labels' (torch.Tensor): Same as input_ids (for causal language modeling).
+            - 'input_ids' (torch.Tensor): A full chunk of tokens of length max_seq_len.
+            - 'position_ids' (torch.Tensor): Sequential indices [0, ..., max_seq_len-1].
+            - 'labels' (torch.Tensor): Identical to input_ids for next-token prediction.
     """
+
+
     def __init__(self, config, tokenizer, total_tokens: int,split : str, eval_samples : int ):
         self.tokenizer = tokenizer
         self.max_seq_len = config.max_seq_len   

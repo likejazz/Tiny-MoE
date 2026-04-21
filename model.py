@@ -222,19 +222,26 @@ class Expert(nn.Module):
 
 class MoE(nn.Module):
     """
-    Sparsely Gated Mixture of Experts (MoE) layer.
+    Sparsely Gated Mixture of Experts (MoE) Layer.
 
-    Routes tokens to a subset of available experts based on router scores. 
-    Includes auxiliary loss for load balancing and z-loss for router stability.
+    This module implements a dynamic routing mechanism that distributes input tokens 
+    across a set of specialized expert networks. By selecting only the top-k experts 
+    per token, it increases model capacity without a linear increase in computation.
 
     Args:
-        config (ModelConfig): Configuration containing 'num_experts', 
-                             'num_experts_per_token', and 'hidden_size'.
+        config (ModelConfig): A configuration object that must have:
+            - num_experts (int): The total pool of expert networks.
+            - num_experts_per_token (int): How many experts each token is routed to.
+            - hidden_size (int): The input and output dimensionality of the tokens.
 
     Returns:
-        output (torch.Tensor): Weighted sum of expert outputs, same shape as input.
-        aux_loss (torch.Tensor): Scalar loss promoting uniform expert utilization.
-        z_loss (torch.Tensor): Scalar loss promoting logit stability.
+        output (torch.Tensor): The aggregated result of expert processing, weighted 
+            by router probabilities. Shape: (batch_size, seq_len, hidden_size).
+        aux_loss (torch.Tensor): A load-balancing loss that penalizes over-reliance 
+            on a small subset of experts.
+        z_loss (torch.Tensor): A stability loss that discourages the router from 
+            producing extremely high-magnitude logits.
+        router_logits (torch.Tensor): The raw scores for each expert before softmax.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -365,19 +372,26 @@ class Transformer(nn.Module):
     """
     Full MoE-MLA Transformer model.
 
-    Assembles the embedding layer, a stack of MoE Transformer blocks, and 
-    the final language modeling head. Supports weight tying and dynamic 
-    gradient checkpointing.
+    Assembles the token embeddings, a stack of MoE-enabled Transformer blocks, 
+    and the final language modeling head. Implements weight tying between 
+    embeddings and the LM head, and supports memory-efficient gradient checkpointing.
 
     Args:
-        config (ModelConfig): Full architectural configuration.
+        config (ModelConfig): Full architectural configuration including 'vocab_size', 
+                             'hidden_size', 'num_layers', and MoE-specific settings.
 
     Returns:
         dict: A dictionary containing:
-            - 'logits' (torch.Tensor): Output predictions [B, T, V].
-            - 'aux_loss' (torch.Tensor): Summed load balancing loss across all layers.
-            - 'z_loss' (torch.Tensor): Summed router stability loss across all layers.
+            - 'logits' (torch.Tensor): Final prediction scores for the vocabulary 
+              across the sequence [batch_size, seq_len, vocab_size].
+            - 'aux_loss' (torch.Tensor): Accumulated load-balancing loss summed 
+              from all internal MoE layers.
+            - 'z_loss' (torch.Tensor): Accumulated router stability loss summed 
+              from all internal MoE layers.
+            - 'router_logits' (torch.Tensor): The raw router scores from the 
+              very last layer in the stack.
     """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         
@@ -411,7 +425,6 @@ class Transformer(nn.Module):
         total_aux_loss = torch.tensor(0.0, device=x.device)
         total_z_loss = torch.tensor(0.0, device=x.device)
         last_router_logits = None
-        use_checkpoint=self.training
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 x, aux_loss, z_loss,router_logits = checkpoint(layer, x, position_ids, use_reentrant=False)
@@ -424,6 +437,7 @@ class Transformer(nn.Module):
             total_z_loss += z_loss
 
         x=self.norm(x)
+        
         logits=self.lm_head(x)
         
         return {

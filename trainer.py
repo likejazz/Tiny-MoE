@@ -127,6 +127,21 @@ class TrainConfig:
     out_dir = "/kaggle/working/checkpoints"
 # Helper Functions 
 def prepare_checkpoint_from_dataset(cfg: TrainConfig):
+    """
+    Bootstraps the training environment by migrating existing checkpoints.
+
+    Searches a fixed input directory for the most recent training state (highest step count) 
+    and copies it to the active working directory. This allows for seamless resuming 
+    when training on platforms with read-only datasets or transient local storage.
+
+    Args:
+        cfg (TrainConfig): Configuration containing 'out_dir', used to define the 
+                          destination path for the copied checkpoint.
+
+    Returns:
+        str | None: The path to the newly prepared checkpoint in the working 
+                   directory, or None if no valid source checkpoint was found.
+    """
 
     SRC_BASE = "/kaggle/input/datasets/abdelrhmanebied/model-checkpoint/checkpoints/regular"
     DST_BASE = os.path.join(cfg.out_dir, "regular")
@@ -209,6 +224,27 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
 
 
 def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
+    """
+    Evaluates the model on a validation dataset to monitor performance.
+
+    Runs inference across a fixed number of steps defined in the config. 
+    Calculates the average cross-entropy loss and perplexity while ensuring 
+    the model is temporarily set to evaluation mode to disable dropout 
+    and other training-specific behaviors.
+
+    Args:
+        model (nn.Module): The transformer model to evaluate.
+        val_dataloader (DataLoader): DataLoader providing the validation data batches.
+        cfg (TrainConfig): Configuration containing 'num_eval_steps' and loss settings.
+        accelerator (Accelerator): The HF Accelerator instance for handling distributed 
+                                  data gathering and device management.
+
+    Returns:
+        tuple: A tuple containing:
+            - val_loss (float): The mean loss across the evaluation steps.
+            - val_ppl (float): The calculated perplexity (exp of the loss).
+    """
+
     model.eval()
     
  
@@ -254,17 +290,23 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
     """
     Main training loop utilizing HF Accelerator for distributed MoE training.
 
-    Handles mixed precision, gradient accumulation, model compilation, 
-    checkpointing (regular and best), and telemetry logging to WandB.
+    Handles mixed precision, gradient accumulation, and dynamic model compilation. 
+    Implements a robust resume system that automatically checks for the best 
+    model or the latest regular checkpoint. Tracks token throughput and 
+    logs telemetry to WandB.
 
     Args:
-        model (torch.nn.Module): The transformer model to train (typically an MoE).
-        dataloader (DataLoader): PyTorch DataLoader providing batches of tokenized data.
-        cfg (TrainConfig): Configuration object containing hyperparameters and 
-                          environment settings.
+        model (torch.nn.Module): The transformer model to train.
+        train_dataloader (DataLoader): DataLoader for training batches.
+        val_dataloader (DataLoader): DataLoader for validation batches.
+        cfg (TrainConfig): Configuration object containing hyperparameters 
+                          (lr, betas, grad_accum_steps), environment settings, 
+                          and MoE-specific loss weights.
 
     Returns:
-        None: The function manages state internally and saves checkpoints to disk.
+        None: Manages training state across distributed processes, saves 
+              checkpoints (model weights + optimizer states), and persists 
+              training metadata (step count, tokens seen, best loss) to disk.
     """
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,

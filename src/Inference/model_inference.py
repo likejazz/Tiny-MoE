@@ -331,20 +331,21 @@ class MoE(nn.Module):
 
 class TransformerBlock(nn.Module):
     """
-    A single Transformer layer combining MLA and MoE.
+    A single Transformer layer combining Multi-Head Latent Attention (MLA) and MoE.
 
-    Features:
-        - Pre-norm architecture using RMSNorm.
-        - Layer Scale (ls1, ls2) for improved deep-network initialization.
-        - Activation Checkpointing on both MLA and MoE to reduce VRAM usage.
+    This block implements a pre-norm residual architecture. It utilizes Layer Scale 
+    (ls1, ls2) to weigh the residual branches, which helps stabilize deep 
+    network initialization.
 
     Args:
-        config (ModelConfig): Configuration object for dimensions and MoE settings.
+        config (ModelConfig): Configuration object for hidden dimensions and MoE settings.
 
     Returns:
-        x (torch.Tensor): The processed hidden states [B, T, D].
-        aux_loss (torch.Tensor): Load balancing loss from the MoE router.
-        z_loss (torch.Tensor): Stability loss from the MoE router.
+        tuple: A tuple containing:
+            - x (torch.Tensor): The processed hidden states [batch_size, seq_len, hidden_size].
+            - aux_loss (torch.Tensor): Load balancing loss from the MoE router.
+            - z_loss (torch.Tensor): Router stability loss (z-loss).
+            - router_logits (torch.Tensor): The raw scores for expert selection.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()

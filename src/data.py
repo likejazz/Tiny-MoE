@@ -10,11 +10,12 @@ from torch.utils.data import IterableDataset,Dataset
 import torch
 from transformers import AutoTokenizer
 from accelerate import Accelerator
-from itertools import islice
+
 
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer.pad_token = tokenizer.eos_token
+seed=3
 
 class PackedStreamingDataset(IterableDataset):
     """
@@ -79,7 +80,7 @@ class PackedStreamingDataset(IterableDataset):
         if split=="eval":
             self.dataset = raw_mixed.take(eval_samples)
         else:
-            self.dataset = raw_mixed.skip(eval_samples).shuffle(seed=3)
+            self.dataset = raw_mixed.skip(eval_samples).shuffle(seed=seed)
         self.token_buffer = []
         self.tokens_yielded = 0
 

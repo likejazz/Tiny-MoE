@@ -11,8 +11,8 @@ from tqdm import tqdm
 import bitsandbytes as bnb
 from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login
-from model import Transformer, ModelConfig
-from data import PackedStreamingDataset
+from src.model import Transformer, ModelConfig
+from src.data import PackedStreamingDataset
 from transformers import AutoTokenizer
 import shutil
 
@@ -114,7 +114,7 @@ class TrainConfig:
 
     # MoE Stability
     router_aux_loss_coef = 0.01
-    router_z_loss_coef = 1e-3
+    router_z_loss_coef = 2e-3
     capacity_factor = 1.1
     top_k = 2
 

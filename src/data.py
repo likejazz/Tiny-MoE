@@ -6,7 +6,7 @@ hf_token = user_secrets.get_secret("HF_TOKEN")
 from huggingface_hub import login
 login(token=hf_token)
 from datasets import load_dataset, interleave_datasets
-from torch.utils.data import IterableDataset,Dataset
+from torch.utils.data import IterableDataset,get_worker_info
 import torch
 from transformers import AutoTokenizer
 from accelerate import Accelerator
@@ -17,22 +17,18 @@ tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer.pad_token = tokenizer.eos_token
 seed=3
 
-class PackedStreamingDataset(IterableDataset):
+class Training_Streaming_Dataset(IterableDataset):
     """
     An efficient streaming dataset that interleaves multiple sources and packs tokens.
 
-    This class mixes data from three major sources (Web, Code, and Math) using 
-    specified probabilities. It solves the 'padding' problem by concatenating 
-    tokenized text into a continuous stream and carving out perfectly sized 
-    chunks of 'max_seq_len'.
+    This class mixes data from three major sources (Web, Code, and Math) and 
+    shards that stream across distributed workers. It concatenates tokenized 
+    text into a continuous stream and yields chunks of 'max_seq_len'.
 
     Args:
-        config (ModelConfig): Configuration containing 'max_seq_len'.
-        tokenizer (PreTrainedTokenizer): The tokenizer used to process raw text.
-        total_tokens (int): The maximum number of tokens to process.
-        split (str): Either "train" or "eval"; determines if the dataset 
-                    shards for distributed training or skips/takes samples.
-        eval_samples (int): The number of samples reserved for the evaluation split.
+        config (ModelConfig): Configuration object containing 'max_seq_len'.
+        tokenizer (PreTrainedTokenizer): The tokenizer used to process raw text 
+                                         and provide the 'eos_token_id'.
 
     Yields:
         dict: A dictionary containing:
@@ -42,85 +38,169 @@ class PackedStreamingDataset(IterableDataset):
     """
 
 
-    def __init__(self, config, tokenizer, total_tokens: int,split : str, eval_samples : int ):
+    def __init__(self, config, tokenizer):
+        super().__init__()
         self.tokenizer = tokenizer
-        self.max_seq_len = config.max_seq_len   
-        self.total_tokens = total_tokens
-        self.split=split
-        
-        # 60% Web
+        self.max_seq_len = config.max_seq_len
+
+
         ds_web = load_dataset(
             "HuggingFaceFW/fineweb-edu",
             name="sample-10BT",
             split="train",
-            streaming=True
+            streaming=True,
         )
-        
-        # 25% Code 
-        ds_code = load_dataset(
+
+        ds_cosmopedia_web = load_dataset(
             "HuggingFaceTB/cosmopedia",
             name="web_samples_v1",
             split="train",
-            streaming=True
+            streaming=True,
         )
-        
-        # 15% Math
+
         ds_math = load_dataset(
             "open-web-math/open-web-math",
             split="train",
-            streaming=True
+            streaming=True,
         )
-        
 
         raw_mixed = interleave_datasets(
-            [ds_web, ds_code, ds_math],
+            [ds_web, ds_cosmopedia_web, ds_math],
             probabilities=[0.60, 0.25, 0.15],
-            stopping_strategy="first_exhausted"
+            stopping_strategy="first_exhausted",
+            seed=seed,
         )
-        if split=="eval":
-            self.dataset = raw_mixed.take(eval_samples)
-        else:
-            self.dataset = raw_mixed.skip(eval_samples).shuffle(seed=seed)
-        self.token_buffer = []
-        self.tokens_yielded = 0
+
+
+        raw_mixed = raw_mixed.shuffle(seed=seed)
+        self.traindataset=raw_mixed
+
+    
 
     def __iter__(self):
-        if self.split == "train":
-            accelerator = Accelerator()
-            
-            iterator = self.dataset.shard(
-                num_shards=accelerator.num_processes, 
-                index=accelerator.process_index
-            )
-        else:
-          iterator=self.dataset
-        for example in iterator:
+        accelerator = Accelerator()
+        process_index = accelerator.process_index
+        num_processes = accelerator.num_processes
 
-            
-            text = (example.get("text") or 
-                    example.get("content") or 
-                    str(example))
-            
-            
+        worker_info = get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+
+        global_worker_id = process_index * num_workers + worker_id
+        total_shards = num_processes * num_workers
+
+        iterator = self.traindataset.shard(
+            num_shards=total_shards,
+            index=global_worker_id,
+        )
+
+        token_buffer = []
+        for example in iterator:
+            text = (
+                example.get("text")
+                or example.get("content")
+                or example.get("article")
+                or str(example)
+            )
+
             tokens = self.tokenizer(
                 text,
                 truncation=False,
-                add_special_tokens=False
+                add_special_tokens=False,
             )["input_ids"]
+
             tokens.append(self.tokenizer.eos_token_id)
-            
-            self.token_buffer.extend(tokens)
-            
-            while len(self.token_buffer) >= self.max_seq_len:
-                chunk = self.token_buffer[:self.max_seq_len]
-                input_ids = torch.tensor(chunk, dtype=torch.long)
+            token_buffer.extend(tokens)
+
+            while len(token_buffer) >= self.max_seq_len + 1:
+                full_chunk = token_buffer[: self.max_seq_len + 1]
+                input_ids = torch.tensor(full_chunk[:-1], dtype=torch.long)
+                labels = torch.tensor(full_chunk[1:], dtype=torch.long)
                 position_ids = torch.arange(self.max_seq_len, dtype=torch.long)
-                
-                yield {"input_ids": input_ids, "position_ids": position_ids, "labels": input_ids}
-                
-                self.token_buffer = self.token_buffer[self.max_seq_len:]
-                self.tokens_yielded += self.max_seq_len
+
+                yield {
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                    "labels": labels,
+                }
+
+                token_buffer = token_buffer[self.max_seq_len:]
+
+class Eval_Streaming_Dataset(IterableDataset):
+    """
+    A streaming dataset for model evaluation using Wikitext-103.
+
+    This class loads the validation split of Wikitext, takes a fixed number 
+    of samples, and packs them into continuous chunks of 'max_seq_len'.
+
+    Args:
+        config (ModelConfig): Configuration containing 'max_seq_len'.
+        tokenizer (PreTrainedTokenizer): The tokenizer used to process raw text.
+        eval_samples (int): The specific number of raw samples to take from 
+                           the validation stream.
+
+    Yields:
+        dict: A dictionary containing:
+            - 'input_ids' (torch.Tensor): A full chunk of tokens of length max_seq_len.
+            - 'position_ids' (torch.Tensor): Sequential indices [0, ..., max_seq_len-1].
+            - 'labels' (torch.Tensor): Identical to input_ids for next-token prediction.
+    """
+
+    def __init__ (self, config, tokenizer,eval_samples : int):
+            super().__init__()
+            self.tokenizer = tokenizer
+            self.max_seq_len = config.max_seq_len
+            self.eval_samples=eval_samples
+        
+            ds_val = load_dataset(
+                "wikitext",
+                "wikitext-103-v1",
+                split="validation",
+                streaming=True,
+            )
+            self.evaldataset=ds_val
+        
+    def __iter__(self):
+        
+
+            iterator = self.evaldataset.take(self.eval_samples)
+
+
+            token_buffer = []
+            for example in iterator:
+                text = (
+                    example.get("text")
+                    or example.get("content")
+                    or example.get("article")
+                    or str(example)
+                )
+
+                tokens = self.tokenizer(
+                    text,
+                    truncation=False,
+                    add_special_tokens=False,
+                )["input_ids"]
+
+                tokens.append(self.tokenizer.eos_token_id)
+                token_buffer.extend(tokens)
+
+                while len(token_buffer) >= self.max_seq_len + 1:
+                    full_chunk = token_buffer[: self.max_seq_len + 1]
+                    input_ids = torch.tensor(full_chunk[:-1], dtype=torch.long)
+                    labels = torch.tensor(full_chunk[1:], dtype=torch.long)
+                    position_ids = torch.arange(self.max_seq_len, dtype=torch.long)
+
+                    yield {
+                        "input_ids": input_ids,
+                        "position_ids": position_ids,
+                        "labels": labels,
+                    }
+
+                    token_buffer = token_buffer[self.max_seq_len:]
             
-
-
-
+        

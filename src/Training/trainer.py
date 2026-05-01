@@ -11,10 +11,11 @@ from tqdm import tqdm
 import bitsandbytes as bnb
 from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login
-from src.model import Transformer, ModelConfig
-from src.data import PackedStreamingDataset
+from model import Transformer, ModelConfig
+from data import Training_Streaming_Dataset,Eval_Streaming_Dataset
 from transformers import AutoTokenizer
 import shutil
+
 
 #  Authentication
 from kaggle_secrets import UserSecretsClient
@@ -68,7 +69,7 @@ class TrainConfig:
         grad_clip (float): Maximum norm for gradient clipping to prevent explosions.
         num_train_steps (int): Total number of iterations to train for.
         warmup_steps (int): Number of steps for the initial linear LR ramp-up.
-        optimizer_type (str): Sets the Optimizer type (PagedAdamW | AdamW) default for AdamW else PagedAdamW.
+        optimizer_type (str): Sets the Optimizer type (PagedAdamW | AdamW |8bit Adam W) default for AdamW Paged For PagedAdamW else 8bit AdamW.
         
         micro_batch_size (int): Number of samples per GPU per forward pass.
         grad_accum_steps (int): Number of steps to accumulate gradients before updating.
@@ -91,18 +92,18 @@ class TrainConfig:
         out_dir (str): Path to the directory where checkpoints are stored.
     """
     # Optimization
-    lr = 3e-4
-    weight_decay = 0.1
+    lr = 1e-3
+    weight_decay = 0.01
     betas = (0.9, 0.95)
     grad_clip = 1.0
-    num_train_steps = 61000
-    warmup_steps = 6100
-    optimizer_type='default'
+    num_train_steps = 45776
+    warmup_steps = 2500
+    optimizer_type='8bitAdamW'
 
     # Batch / Throughput
-    micro_batch_size = 16
-    grad_accum_steps = 8
-    max_seq_len = 1024
+    micro_batch_size = 32
+    grad_accum_steps =4
+    max_seq_len = 512
 
     # Precision / Performance
     mixed_precision = "fp16"
@@ -113,34 +114,28 @@ class TrainConfig:
     activation_checkpointing = True
 
     # MoE Stability
-    router_aux_loss_coef = 0.01
-    router_z_loss_coef = 2e-3
+    router_aux_loss_coef = 0.002
+    router_z_loss_coef = 1e-4
     capacity_factor = 1.1
     top_k = 2
 
     # Logging
-    save_interval=300
-    num_eval_steps = 25
-    eval_interval = 500
+    save_interval=700
+    num_eval_steps = 50
+    eval_interval = 1000
     save_best_model = False
     log_interval = 20
     out_dir = "/kaggle/working/checkpoints"
 # Helper Functions 
 def prepare_checkpoint_from_dataset(cfg: TrainConfig):
     """
-    Bootstraps the training environment by migrating existing checkpoints.
-
-    Searches a fixed input directory for the most recent training state (highest step count) 
-    and copies it to the active working directory. This allows for seamless resuming 
-    when training on platforms with read-only datasets or transient local storage.
+    Finds and copies the latest model checkpoint from a read-only dataset to the local working directory.
 
     Args:
-        cfg (TrainConfig): Configuration containing 'out_dir', used to define the 
-                          destination path for the copied checkpoint.
+        cfg (TrainConfig): Configuration object containing 'out_dir'.
 
     Returns:
-        str | None: The path to the newly prepared checkpoint in the working 
-                   directory, or None if no valid source checkpoint was found.
+        str or None: The local path to the copied checkpoint, or None if no checkpoint exists.
     """
 
     SRC_BASE = "/kaggle/input/datasets/abdelrhmanebied/model-checkpoint/checkpoints/regular"
@@ -207,11 +202,10 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
     aux_loss = outputs.get("aux_loss", 0.0)
     z_loss = outputs.get("z_loss", 0.0)
     
-    shift_logits = logits[:, :-1, :]
     shift_targets = targets[:, 1:]
 
     loss = F.cross_entropy(
-        shift_logits.reshape(-1, shift_logits.size(-1)),
+        logits[:, :-1, :].reshape(-1, logits.size(-1)),
         shift_targets.reshape(-1),
         ignore_index=-100
     )
@@ -225,34 +219,27 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
 
 def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
     """
-    Evaluates the model on a validation dataset to monitor performance.
-
-    Runs inference across a fixed number of steps defined in the config. 
-    Calculates the average cross-entropy loss and perplexity while ensuring 
-    the model is temporarily set to evaluation mode to disable dropout 
-    and other training-specific behaviors.
+    Evaluates the model on a validation set to compute loss and perplexity.
 
     Args:
-        model (nn.Module): The transformer model to evaluate.
-        val_dataloader (DataLoader): DataLoader providing the validation data batches.
-        cfg (TrainConfig): Configuration containing 'num_eval_steps' and loss settings.
-        accelerator (Accelerator): The HF Accelerator instance for handling distributed 
-                                  data gathering and device management.
+        model (nn.Module): The model to evaluate.
+        val_dataloader (DataLoader): Iterator providing validation batches.
+        cfg (TrainConfig): Configuration for evaluation steps and loss coefficients.
+        accelerator (Accelerator): HF Accelerator for distributed reduction and device management.
 
     Returns:
-        tuple: A tuple containing:
-            - val_loss (float): The mean loss across the evaluation steps.
-            - val_ppl (float): The calculated perplexity (exp of the loss).
+        tuple (float, float): A tuple containing the global average (validation loss, perplexity).
     """
 
     model.eval()
-    
+    model= accelerator.unwrap_model(model)
  
     data_iter = iter(val_dataloader)
     
     device = accelerator.device
-    running_loss = torch.tensor(0.0, device=device)
-
+    local_loss_sum = torch.tensor(0.0, device=device)
+    local_count = torch.tensor(0.0, device=device)
+    
     with torch.inference_mode():
    
         for step, batch in enumerate(data_iter):
@@ -265,22 +252,23 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
 
      
             if "position_ids" in batch:
-                position_ids = batch["position_ids"]
+                position_ids = batch["position_ids"].to(device, non_blocking=True)
             else:
  
                 batch_size, seq_len = input_ids.shape
-                position_ids = torch.arange(seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size, -1)
-
+                position_ids = torch.arange(seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size, -1)\
+                
             outputs = model(input_ids, position_ids=position_ids)
             loss = compute_loss(outputs, labels, cfg)
-            loss = accelerator.gather(loss).mean()
-            running_loss += loss
+            
+            batch_size = input_ids.size(0)
+            local_loss_sum += loss.detach() * batch_size
+            local_count += batch_size
 
+    global_loss_sum = accelerator.reduce(local_loss_sum, reduction="sum")
+    global_count = accelerator.reduce(local_count, reduction="sum")
 
-
-
-   
-    val_loss = (running_loss / cfg.num_eval_steps).item()
+    val_loss = (global_loss_sum / global_count).item()
     val_ppl = math.exp(min(val_loss, 20))
 
     model.train()
@@ -288,25 +276,32 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
     
 def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: TrainConfig):
     """
-    Main training loop utilizing HF Accelerator for distributed MoE training.
+    Executes a distributed training loop with support for MoE-specific logging, 
+    mixed precision, and automated checkpoint management.
 
-    Handles mixed precision, gradient accumulation, and dynamic model compilation. 
-    Implements a robust resume system that automatically checks for the best 
-    model or the latest regular checkpoint. Tracks token throughput and 
-    logs telemetry to WandB.
+    This function handles the end-to-end training process including optimizer 
+    initialization (supporting 8-bit variants), model compilation, gradient 
+    accumulation, and periodic evaluation. It also features a robust resume 
+    mechanism that automatically detects the latest or best checkpoint.
 
     Args:
-        model (torch.nn.Module): The transformer model to train.
-        train_dataloader (DataLoader): DataLoader for training batches.
-        val_dataloader (DataLoader): DataLoader for validation batches.
-        cfg (TrainConfig): Configuration object containing hyperparameters 
-                          (lr, betas, grad_accum_steps), environment settings, 
-                          and MoE-specific loss weights.
+        model (torch.nn.Module): The transformer model to be trained.
+        train_dataloader (DataLoader): Iterable yielding training batches.
+        val_dataloader (DataLoader): Iterable yielding validation batches.
+        cfg (TrainConfig): Configuration object containing hyperparameters such as 
+            learning rate, weight decay, optimization type, checkpoint intervals, 
+            and MoE-specific settings.
 
-    Returns:
-        None: Manages training state across distributed processes, saves 
-              checkpoints (model weights + optimizer states), and persists 
-              training metadata (step count, tokens seen, best loss) to disk.
+    Side Effects:
+        - Initializes a WandB run and logs metrics (loss, perplexity, router load, etc.).
+        - Saves model weights and optimizer states to `cfg.out_dir`.
+        - Prints training progress to the console via the main process accelerator.
+        - Enables gradient checkpointing and torch compilation on the model if configured.
+
+    Note:
+        The function specifically calculates MoE metrics if the model outputs 
+        `router_logits`, including expert load balancing, entropy, and utilization 
+        to monitor for expert collapse.
     """
     accelerator = Accelerator(
         mixed_precision=cfg.mixed_precision,
@@ -321,7 +316,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="Tiny-MoE",
+            project_name="Tiny-MoE-2",
             config=vars(cfg)
         )
         
@@ -344,23 +339,37 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         weight_decay=cfg.weight_decay,
         fused=True
         )
-    else:
+        print('Using AdamW')
+    elif cfg.optimizer_type== "Paged":
         optimizer =bnb.optim.PagedAdamW8bit(
         model.parameters(),
         lr=cfg.lr,
         betas=cfg.betas,
         weight_decay=cfg.weight_decay
         )
+        print('Using PagedAdamW')
+    else:
+        optimizer =bnb.optim.AdamW8bit(
+        model.parameters(),
+        lr=cfg.lr,
+        betas=cfg.betas,
+        weight_decay=cfg.weight_decay
+        )
+        print('Using 8bitAdamW')
 
-    
+
+    base_model = model 
+    if cfg.compile_model:
+        accelerator.print("Compiling model...")
+        accelerator.print(f"Compiling Method is {cfg.compile_type}")
+        model = torch.compile(base_model,mode=cfg.compile_type,dynamic=True, fullgraph=False)
+
     model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader
     )
-        
-    if cfg.compile_model:
-        accelerator.print("Compiling model...")
-        model = torch.compile(model,mode=cfg.compile_type)
-        
+
+
+    eval_model=base_model
     prepare_checkpoint_from_dataset(cfg)
     best_loss=float("inf")
     best_step=0
@@ -441,9 +450,14 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
             input_ids = batch["input_ids"].to(device,non_blocking=True)
             
             labels = batch.get("labels", input_ids).to(device,non_blocking=True)
-            pos_base = batch.get("position_ids", torch.arange(cfg.max_seq_len, device=device))
-            position_ids = pos_base.view(1, -1).expand(input_ids.shape[0], -1)
-            
+
+            curr_bsz, curr_seq_len = input_ids.shape 
+
+
+            pos_base = torch.arange(curr_seq_len, device=device)
+
+            position_ids = pos_base.unsqueeze(0).expand(curr_bsz, -1) 
+
             
             outputs = model(input_ids,position_ids=position_ids)
             loss = compute_loss(outputs, labels, cfg)
@@ -473,9 +487,12 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                 perplexity = math.exp(min(current_loss, 20))
                 step_time = time.perf_counter() - step_start
                 tps = global_step_tokens / step_time
+                accelerator.wait_for_everyone()
                 if step % cfg.eval_interval == 0:
-                    val_loss, val_ppl = evaluate(model, val_dataloader, cfg, accelerator)
                     accelerator.print("Evaluating Now...")
+                    accelerator.wait_for_everyone()
+                    val_loss, val_ppl = evaluate(eval_model, val_dataloader, cfg, accelerator)
+                    accelerator.wait_for_everyone()
                     
                 is_best=current_loss<best_loss
                 if is_best:
@@ -573,13 +590,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                         ).indices
                 
                         chosen_experts = topk_indices.reshape(-1)
-                
-                        
-                        unique_experts = torch.unique(chosen_experts)
-                        utilization = unique_experts.numel() / num_experts
-                
 
-                        log_data["router/utilization_pct"] = utilization
 
                         counts = torch.bincount(
                             chosen_experts, minlength=num_experts
@@ -596,7 +607,8 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
 
                         entropy = -(load * (load + 1e-9).log()).sum()
                         log_data["router/entropy"] = entropy.item()
-
+                        utilization=torch.exp(entropy)/num_experts
+                        log_data["router/utilization"] = utilization.item()
                         probs = torch.softmax(logits, dim=-1)
                         confidence = probs.max(dim=-1).values.mean()
                         log_data["router/confidence"] = confidence.item()
@@ -622,7 +634,7 @@ if __name__ == "__main__":
     config = ModelConfig()
     model = Transformer(config)
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-    train_dataset = PackedStreamingDataset(config, tokenizer,total_tokens=2_000_000_000)
+    train_dataset = Training_Streaming_Dataset(config, tokenizer)
     train_dataloader = DataLoader(train_dataset, 
                             batch_size=cfg.micro_batch_size,
                             drop_last=True,
@@ -630,16 +642,14 @@ if __name__ == "__main__":
                             prefetch_factor=2,
                            persistent_workers=True,
                             pin_memory=True)
-    val_dataset = PackedStreamingDataset(config, 
-                                         tokenizer, 
-                                         total_tokens=10_000_000)
+    val_dataset = Eval_Streaming_Dataset(config, 
+                                         tokenizer,
+                                         eval_samples=1200)
     val_dataloader = DataLoader(
                         val_dataset,
                         batch_size=cfg.micro_batch_size,
                         drop_last=True,
-                        num_workers=2,
-                        prefetch_factor=2,
-                        persistent_workers=True,
+                        num_workers=0,
                         pin_memory=True)
                     
     train(model, train_dataloader, val_dataloader, cfg)

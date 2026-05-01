@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
 from torch.utils.checkpoint import checkpoint
+import math
 
 
 
@@ -13,39 +14,60 @@ from torch.utils.checkpoint import checkpoint
 @dataclass
 class ModelConfig:
     """
-    Configuration class for a DeepSeek-style MoE model with MLA.
+    Model configuration settings for the model.
 
-    Attributes:
-        vocab_size (int): Total number of tokens in the vocabulary.
-        hidden_size (int): Dimensionality of the model layers.
-        num_layers (int): Total number of transformer blocks.
-        initializer_range (float): Standard deviation for weight initialization.
-        tie_word_embeddings (bool): Whether to share weights between input and output embeddings.
-        max_seq_len (int): Maximum sequence length (context window).
+    ### General Settings
+    - vocab_size (int): Total number of tokens in the vocabulary.
+    - hidden_size (int): The main embedding dimension used across all layers.
+    - num_layers (int): The number of sequential Transformer blocks.
+    - initializer_range (float): Scale for weight initialization to ensure stable gradients.
+    - tie_word_embeddings (bool): Whether to reuse embedding weights for the final output projection.
+    - max_seq_len (int): The maximum context window size for the model.
+    - max_batch_size (int): The maximum number of sequences to process at once.
 
-        rms_norm_eps (float): Small constant added to denominator in RMSNorm for stability.
-        rope_theta (float): The base period for Rotary Positional Embeddings (RoPE).
+    ### Normalization
+    - rms_norm_eps (float): A tiny value added during RMSNorm to prevent division by zero.
 
-        # MLA (Multi-head Latent Attention)
-        num_attention_heads (int): Number of attention heads.
-        kv_lora_rank (int): The rank of the compressed KV latent vector.
-        qk_nope_dim (int): Dimension of the Non-rope part of Query/Key projections.
-        qk_rope_dim (int): Dimension of the Rotary-enabled part of Query/Key projections.
+    ### RoPE & YaRN (Positional Encoding)
+    - rope_theta (float): The base constant for rotary frequency calculations.
+    - rope_type (str): The method for context scaling (e.g., 'yarn' for long-context support).
+    - beta_slow (float): Controls the low-frequency boundary for YaRN interpolation.
+    - beta_fast (float): Controls the high-frequency boundary for YaRN interpolation.
+    - factor (float): The scaling factor for stretching the context window (e.g., 2.0 doubles the length).
+    - mscale (Optional[int]): Scaling factor for attention logits to prevent entropy collapse in long sequences.
+    - original_max_seq_len (int): The starting context length the model was originally 
+        trained on (e.g., 4096) before applying context extension techniques like YaRN.
 
-        # MoE (Mixture of Experts)
-        num_experts (int): Total number of available experts in each MoE layer.
-        num_experts_per_token (int): Number of experts activated for each token (Top-K).
-        moe_intermediate_size (int): The hidden dimension size inside each individual expert.
+    ### MLA (Multi-Head Latent Attention)
+    - num_attention_heads (int): Number of parallel attention heads.
+    - kv_lora_rank (int): The compressed dimension for KV vectors, used to minimize KV-cache memory usage.
+    - qk_nope_dim (int): The dimension of the query/key vectors that remain "Non-Positionally Encoded."
+    - qk_rope_dim (int): The dimension of the query/key vectors where RoPE is applied.
+
+    ### MoE (Mixture of Experts)
+    - num_experts (int): The total pool of expert sub-networks in each layer.
+    - num_experts_per_token (int): The "Top-K" value; how many experts are active for a single token.
+    - moe_intermediate_size (int): The hidden expansion dimension within each individual expert's FFN.
     """
     vocab_size: int = 32000
     hidden_size: int = 512
-    num_layers: int = 8
+    num_layers: int = 12
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
-    max_seq_len: int = 512
-
+    max_seq_len: int = 1024
+    max_batch_size: int = 1
+    
+    # RMSNorm
     rms_norm_eps: float = 1e-6
+    
+    # RoPE & YaRN 
     rope_theta: float = 10000.0
+    rope_type: str = "default"
+    beta_slow: float = 1.0
+    beta_fast: float = 32.0
+    factor: float = 1.0
+    mscale: Optional[float] = None
+    original_max_seq_len: int = 512
 
     # MLA
     num_attention_heads: int = 8
@@ -57,6 +79,7 @@ class ModelConfig:
     num_experts: int = 8
     num_experts_per_token: int = 2
     moe_intermediate_size: int = 1024
+
 
 
 
@@ -87,22 +110,34 @@ class RMSNorm(nn.Module):
 
 class RoPE(nn.Module):
     """
-    Implements Rotary Positional Embeddings (RoPE) using complex number rotation.
+    Rotary Positional Embeddings (RoPE) with YaRN scaling support.
 
     Args:
-        config (ModelConfig): Configuration containing 'qk_rope_dim', 'max_seq_len', 
-                             and optional 'rope_theta'.
+        config (ModelConfig): Config containing rope dimensions, theta, 
+            and scaling factors for long-context extension.
 
-    Yields:
-        torch.Tensor: The input tensor with rotary embeddings applied, 
-                      maintaining the original input shape.
+    Returns:
+        torch.Tensor: The input tensor with rotary position embeddings applied.
     """
-
     def __init__(self, config):
         super().__init__()
+
         self.dim = config.qk_rope_dim
         self.max_seq_len = getattr(config, "max_seq_len", 1024)
         self.theta = getattr(config, "rope_theta", 10000.0)
+
+        self.rope_type = getattr(config, "rope_type", "default") 
+
+  
+        self.factor = float(getattr(config, "factor", 1.0))
+        self.original_max_seq_len = int(
+            getattr(config, "original_max_seq_len", self.max_seq_len)
+        )
+        self.beta_slow = float(getattr(config, "beta_slow", 1.0))
+        self.beta_fast = float(getattr(config, "beta_fast", 32.0))
+
+
+        self.attention_factor = getattr(config, "mscale", None)
 
         if self.dim % 2 != 0:
             raise ValueError("qk_rope_dim must be even")
@@ -110,19 +145,50 @@ class RoPE(nn.Module):
         inv_freq = 1.0 / (
             self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim)
         )
+
+        if self.rope_type == "yarn":
+            inv_freq = self._build_yarn_inv_freq(inv_freq)
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
         t = torch.arange(self.max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
+        freqs = torch.outer(t, self.inv_freq)
         self.register_buffer(
             "freqs_cis",
             torch.polar(torch.ones_like(freqs), freqs),
             persistent=False,
         )
 
+    def _build_yarn_inv_freq(self, inv_freq: torch.Tensor) -> torch.Tensor:
+        """
+        Computes YaRN-scaled frequencies for context window extension.
+
+        Args:
+            inv_freq (torch.Tensor): Original inverse frequencies.
+
+        Returns:
+            torch.Tensor: Scaled frequencies based on the YaRN interpolation method.
+        """
+        
+        s = max(self.factor, 1.0)
+
+        if s == 1.0:
+            return inv_freq
+
+        wavelengths = 2.0 * math.pi / inv_freq
+        r = self.original_max_seq_len / wavelengths
+
+        ramp = ((r - self.beta_slow) / (self.beta_fast - self.beta_slow)).clamp(0.0, 1.0)
+
+        inv_freq_scaled = inv_freq / s
+        inv_freq_yarn = (1.0 - ramp) * inv_freq_scaled + ramp * inv_freq
+        return inv_freq_yarn
+
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         squeeze_head = False
 
         if x.dim() == 3:
-            x = x.unsqueeze(2)
+            x = x.unsqueeze(2)  
             squeeze_head = True
         elif x.dim() != 4:
             raise ValueError("RoPE expects x with shape [B, T, D] or [B, T, H, D]")
@@ -133,6 +199,12 @@ class RoPE(nn.Module):
 
         if dim % 2 != 0:
             raise ValueError("RoPE dimension must be even")
+
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}. "
+                "Increase max_seq_len or extend the cache."
+            )
 
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=device, dtype=torch.long)
@@ -151,7 +223,9 @@ class RoPE(nn.Module):
         else:
             raise ValueError("position_ids must have shape [T] or [B, T]")
 
-        x_complex = torch.view_as_complex(x.float().reshape(bsz, seq_len, n_heads, dim // 2, 2))
+        x_complex = torch.view_as_complex(
+            x.float().reshape(bsz, seq_len, n_heads, dim // 2, 2)
+        )
         y = x_complex * freqs
         y = torch.view_as_real(y).flatten(-2).to(dtype)
 
@@ -350,15 +424,19 @@ class MoE(nn.Module):
         packed_outputs = torch.matmul(expert_hidden, self.w2.transpose(1, 2))
 
 
-        sorted_outputs = packed_outputs[valid_mask]
-        unsort_perm = torch.argsort(sort_perm)
-        sorted_outputs = sorted_outputs[unsort_perm]
+        packed_outputs = torch.matmul(expert_hidden, self.w2.transpose(1, 2))
 
+        valid_outputs = packed_outputs[valid_mask]
 
-        sorted_outputs = sorted_outputs.view(N, K, hidden)
+        combined_outputs = torch.empty((N * K, hidden), device=x.device, dtype=x.dtype)
+
+        combined_outputs[sort_perm] = valid_outputs
+
+        sorted_outputs = combined_outputs.view(N, K, hidden)
         routed_out = (sorted_outputs * topk_weights.unsqueeze(-1)).sum(dim=1)
-
+        
         output = (shared_out + routed_out).view(bsz, seq_len, hidden)
+    
         return output, aux_loss, z_loss, router_logits
 
 class TransformerBlock(nn.Module):

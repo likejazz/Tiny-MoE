@@ -39,10 +39,10 @@ class ModelConfig:
     """
     vocab_size: int = 32000
     hidden_size: int = 512
-    num_layers: int = 12
+    num_layers: int = 8
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
-    max_seq_len: int = 1024
+    max_seq_len: int = 512
 
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
@@ -87,58 +87,94 @@ class RMSNorm(nn.Module):
 
 class RoPE(nn.Module):
     """
-    Rotary Positional Embedding (RoPE) using complex number rotation.
-
-    Applies a relative position encoding by rotating segments of the query and key
-    embeddings in complex space, allowing the model to capture relative distances
-    between tokens effectively.
+    Implements Rotary Positional Embeddings (RoPE) using complex number rotation.
 
     Args:
-        config (ModelConfig): Config containing 'qk_rope_dim', 'max_seq_len', 
-                             and 'rope_theta'.
+        config (ModelConfig): Configuration containing 'qk_rope_dim', 'max_seq_len', 
+                             and optional 'rope_theta'.
 
-    Attributes:
-        freqs_cis (torch.Tensor): Precomputed complex exponential (cos + i*sin) 
-                                 cache for all possible positions up to max_seq_len.
+    Yields:
+        torch.Tensor: The input tensor with rotary embeddings applied, 
+                      maintaining the original input shape.
     """
-    def __init__(self, config: ModelConfig):
+
+    def __init__(self, config):
         super().__init__()
         self.dim = config.qk_rope_dim
-        self.max_seq_len = config.max_seq_len
-        self.theta = config.rope_theta
-        freqs = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim))
+        self.max_seq_len = getattr(config, "max_seq_len", 1024)
+        self.theta = getattr(config, "rope_theta", 10000.0)
+
+        if self.dim % 2 != 0:
+            raise ValueError("qk_rope_dim must be even")
+
+        inv_freq = 1.0 / (
+            self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim)
+        )
         t = torch.arange(self.max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, freqs)
-        self.register_buffer("freqs_cis", torch.polar(torch.ones_like(freqs), freqs), persistent=False)
+        freqs = torch.outer(t, inv_freq)
+        self.register_buffer(
+            "freqs_cis",
+            torch.polar(torch.ones_like(freqs), freqs),
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
-        dtype = x.dtype
-        seq_len = x.shape[1]
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=x.device)
-        freqs_cis = self.freqs_cis[:seq_len].view(1, seq_len, 1, -1)
-        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        x_rotated = x_complex * freqs_cis
-        return torch.view_as_real(x_rotated).flatten(3).to(dtype)
+        squeeze_head = False
 
+        if x.dim() == 3:
+            x = x.unsqueeze(2)
+            squeeze_head = True
+        elif x.dim() != 4:
+            raise ValueError("RoPE expects x with shape [B, T, D] or [B, T, H, D]")
+
+        dtype = x.dtype
+        device = x.device
+        bsz, seq_len, n_heads, dim = x.shape
+
+        if dim % 2 != 0:
+            raise ValueError("RoPE dimension must be even")
+
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=device, dtype=torch.long)
+        else:
+            position_ids = torch.as_tensor(position_ids, device=device, dtype=torch.long)
+
+        if position_ids.dim() == 0:
+            position_ids = position_ids.view(1)
+
+        if position_ids.dim() == 1:
+            freqs = self.freqs_cis.index_select(0, position_ids).unsqueeze(0).unsqueeze(2)
+        elif position_ids.dim() == 2:
+            if position_ids.shape != (bsz, seq_len):
+                raise ValueError("position_ids shape must match [B, T]")
+            freqs = self.freqs_cis[position_ids].unsqueeze(2)
+        else:
+            raise ValueError("position_ids must have shape [T] or [B, T]")
+
+        x_complex = torch.view_as_complex(x.float().reshape(bsz, seq_len, n_heads, dim // 2, 2))
+        y = x_complex * freqs
+        y = torch.view_as_real(y).flatten(-2).to(dtype)
+
+        if squeeze_head:
+            y = y.squeeze(2)
+
+        return y
 class MLA(nn.Module):
     """
-    Multi-head Latent Attention (MLA) with KV Compression.
+    Implements Multi-Head Latent Attention (MLA) with Low-Rank Compression.
 
-    MLA reduces the KV cache size by projecting Keys and Values into a low-rank 
-    latent space (c_kv). It also separates Query/Key components into 
-    content-based (nope) and position-based (rope) vectors.
+    This module reduces the KV cache footprint by projecting hidden states into a 
+    latent space before up-projecting into query, key, and value components. It 
+    uses a split-stream approach for Rotary Positional Embeddings (RoPE).
 
     Args:
-        config (ModelConfig): Configuration object containing hidden_size, 
-                             lora_rank, and attention dimensions.
+        config (ModelConfig): Configuration object containing 'hidden_size', 
+                             'kv_lora_rank', 'qk_nope_dim', and 'qk_rope_dim'.
 
-    Attributes:
-        w_dkv (nn.Linear): Down-projection for Keys and Values into latent space.
-        w_dq (nn.Linear): Down-projection for Queries into latent space.
-        rope (RoPE): Rotary Positional Embedding module for the 'rope' dimensions.
-        scale (float): Scaling factor for the attention scores (1/sqrt(head_dim)).
+    Returns:
+        torch.Tensor: The attention output tensor of shape [batch, seq_len, hidden_size].
     """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -148,10 +184,19 @@ class MLA(nn.Module):
         self.qk_rope_dim = config.qk_rope_dim
         self.head_dim = self.qk_nope_dim + self.qk_rope_dim
 
-        self.w_dkv = nn.Linear(self.hidden_size, self.kv_lora_rank, bias=False)
-        self.w_dq = nn.Linear(self.hidden_size, self.kv_lora_rank, bias=False)
-        self.w_ukv = nn.Linear(self.kv_lora_rank,self.num_heads * self.head_dim * 2,  bias=False )
-        self.w_uq_qr = nn.Linear(self.kv_lora_rank,self.num_heads * self.head_dim + self.num_heads * self.qk_rope_dim,bias=False)
+   
+        self.w_in = nn.Linear(self.hidden_size, 2 * self.kv_lora_rank, bias=False)
+
+        self.w_ukv = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * self.head_dim * 2,
+            bias=False,
+        )
+        self.w_uq_qr = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * self.head_dim + self.num_heads * self.qk_rope_dim,
+            bias=False,
+        )
         self.w_kr = nn.Linear(self.hidden_size, self.qk_rope_dim, bias=False)
         self.w_o = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
@@ -161,192 +206,175 @@ class MLA(nn.Module):
         bsz, seq_len, _ = x.shape
 
 
-        c_kv = self.w_dkv(x)
-        kv = self.w_ukv(c_kv)  
-        kv = kv.view(bsz, seq_len, self.num_heads, 2 * self.head_dim)
-        k_nope, v = kv.split(self.head_dim, dim=-1)
+
+        c_in = self.w_in(x)
+        c_kv, c_q = c_in.split(self.kv_lora_rank, dim=-1)
 
 
-        c_q = self.w_dq(x)
-        q_proj = self.w_uq_qr(c_q)  
-        q_proj = q_proj.view(bsz, seq_len, self.num_heads, self.head_dim + self.qk_rope_dim)
+
+        kv = self.w_ukv(c_kv).reshape(bsz, seq_len, self.num_heads, 2 * self.head_dim)
+        k_nope, v = kv.chunk(2, dim=-1)
+
+
+        q_proj = self.w_uq_qr(c_q).reshape(
+            bsz, seq_len, self.num_heads, self.head_dim + self.qk_rope_dim
+        )
         q_nope, q_rope = q_proj.split([self.head_dim, self.qk_rope_dim], dim=-1)
 
-        k_rope = self.w_kr(x).view(bsz, seq_len, 1, self.qk_rope_dim)
 
+        k_rope = self.w_kr(x).unsqueeze(2)  
+       
         q_rope = self.rope(q_rope, position_ids)
         k_rope = self.rope(k_rope, position_ids)
 
-        q = torch.cat([q_nope, q_rope], dim=-1)
-        k_rope = k_rope.repeat(1, 1, self.num_heads, 1)
-        k = torch.cat([k_nope, k_rope], dim=-1)
 
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-        def sdpa_func(q_in, k_in, v_in):
-            return F.scaled_dot_product_attention(
-                q_in, k_in, v_in,
-                is_causal=True
-            )
+        k_rope = k_rope.expand(-1, -1, self.num_heads, -1)
 
-        attn_output = sdpa_func(q, k, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.head_dim)
+        q = torch.cat((q_nope, q_rope), dim=-1).transpose(1, 2)
+        k = torch.cat((k_nope, k_rope), dim=-1).transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        attn_output = F.scaled_dot_product_attention(q, k, v,is_causal=True)
+
+        attn_output = attn_output.transpose(1, 2).reshape(
+            bsz, seq_len, self.num_heads * self.head_dim
+        )
         return self.w_o(attn_output)
 
-class Expert(nn.Module):
-    """
-    A single Mixture of Experts (MoE) feed-forward block using SwiGLU activation.
 
-    This block implements the Gated Linear Unit variant where the hidden 
-    representation is the element-wise product of a SiLU-activated linear 
-    projection (w1) and a gated linear projection (w3).
-
-    Args:
-        config (ModelConfig): Config object with 'hidden_size' and 
-                             'moe_intermediate_size'.
-
-    Attributes:
-        w1 (nn.Linear): The "gate" projection.
-        w2 (nn.Linear): The "down" projection back to hidden_size.
-        w3 (nn.Linear): The "up" projection.
-    """
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.w1 = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
-        self.w2 = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)
-        self.w3 = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
-
-    def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class MoE(nn.Module):
     """
-    Sparsely Gated Mixture of Experts (MoE) Layer.
+    Implements a Mixture-of-Experts (MoE) layer with shared and routed experts.
 
-    This module implements a dynamic routing mechanism that distributes input tokens 
-    across a set of specialized expert networks. By selecting only the top-k experts 
-    per token, it increases model capacity without a linear increase in computation.
+    This module routes tokens to the top-K specialized experts while concurrently 
+    processing them through a shared expert to capture common knowledge. It 
+    includes load balancing (auxiliary loss) and stability (z-loss) mechanisms.
 
     Args:
-        config (ModelConfig): A configuration object that must have:
-            - num_experts (int): The total pool of expert networks.
-            - num_experts_per_token (int): How many experts each token is routed to.
-            - hidden_size (int): The input and output dimensionality of the tokens.
+        config (ModelConfig): Configuration containing 'num_experts', 
+                             'num_experts_per_token', and 'moe_intermediate_size'.
 
     Returns:
-        output (torch.Tensor): The aggregated result of expert processing, weighted 
-            by router probabilities. Shape: (batch_size, seq_len, hidden_size).
-        aux_loss (torch.Tensor): A load-balancing loss that penalizes over-reliance 
-            on a small subset of experts.
-        z_loss (torch.Tensor): A stability loss that discourages the router from 
-            producing extremely high-magnitude logits.
-        router_logits (torch.Tensor): The raw scores for each expert before softmax.
+        tuple: A tuple containing:
+            - output (torch.Tensor): Combined output from shared and routed experts.
+            - aux_loss (torch.Tensor): Load balancing loss for the router.
+            - z_loss (torch.Tensor): Stability loss to prevent logit explosion.
+            - router_logits (torch.Tensor): Raw logits from the expert selection.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.num_experts = config.num_experts
         self.num_experts_per_token = config.num_experts_per_token
-        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([Expert(config) for _ in range(self.num_experts)])
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+
+        self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+
+
+        self.w13 = nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_size, self.hidden_size)
+        )
+        self.w2 = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
+        )
+        self.shared_w13 = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
+        self.shared_w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.router.weight)
+        nn.init.xavier_uniform_(self.w13)
+        nn.init.xavier_uniform_(self.w2)
+        nn.init.xavier_uniform_(self.shared_w13.weight)
+        nn.init.xavier_uniform_(self.shared_w2.weight)
 
     def forward(self, x: torch.Tensor):
         bsz, seq_len, hidden = x.shape
-        x_flat = x.reshape(-1, hidden)  
+        x_flat = x.reshape(-1, hidden)
         N = x_flat.shape[0]
+        E = self.num_experts
+        K = self.num_experts_per_token
+        I = self.intermediate_size
+
+        gate_up_shared = self.shared_w13(x_flat)
+        gate_s, up_s = gate_up_shared.chunk(2, dim=-1)
+        shared_out = self.shared_w2(F.silu(gate_s) * up_s)
+        
+        router_logits = self.router(x_flat).float()
 
 
-        router_logits = self.router(x_flat)
+        topk_logits, topk_indices = torch.topk(router_logits, K, dim=-1)
+        topk_weights = F.softmax(topk_logits, dim=-1)
+
+
         router_probs = F.softmax(router_logits, dim=-1)
+        importance = router_probs.mean(dim=0)  
+        load = (topk_indices.reshape(-1).bincount(minlength=E).float())
+        load = load / load.sum()
+
+        aux_loss = (importance * load).sum() * E
 
 
-        z_loss = 1e-3 * torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+        z_loss =  torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
 
 
-        topk_weights, topk_indices = torch.topk(
-            router_probs, self.num_experts_per_token, dim=-1
-        )
-
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
+        expert_ids = topk_indices.reshape(-1)
+        token_ids = torch.arange(N, device=x.device).unsqueeze(1).expand(N, K).reshape(-1)
+        gates = topk_weights.reshape(-1)
 
 
-        importance = router_probs.mean(dim=0)        
-        load = router_probs.sum(dim=0)               
+        sort_perm = torch.argsort(expert_ids)
+        expert_ids = expert_ids[sort_perm]
+        token_ids = token_ids[sort_perm]
+        gates = gates[sort_perm]
 
-        load = load / (load.sum() + 1e-6)
-
-        aux_loss = torch.sum(importance * load) * self.num_experts
-
-        token_indices = torch.arange(N, device=x.device).unsqueeze(1).expand_as(topk_indices)
-
-        flat_experts = topk_indices.reshape(-1)
-        flat_tokens = token_indices.reshape(-1)
-        flat_gates = topk_weights.reshape(-1)
-
-        sorted_idx = torch.argsort(flat_experts)
-        inverse_idx = torch.argsort(sorted_idx)
-
-        flat_experts = flat_experts[sorted_idx]
-        flat_tokens = flat_tokens[sorted_idx]
-        flat_gates = flat_gates[sorted_idx]
-
-        sorted_inputs = x_flat[flat_tokens]
+ 
+        counts = torch.bincount(expert_ids, minlength=E)
+        counts = counts.to(x.device)
+        max_count = counts.max()
 
 
-        expert_counts = torch.bincount(
-            flat_experts,
-            minlength=self.num_experts
-        )
+        valid_mask = torch.arange(max_count, device=x.device).unsqueeze(0) < counts.unsqueeze(1)
 
-        sorted_outputs = torch.empty_like(sorted_inputs)
-
-        start = 0
-        for expert_idx in range(self.num_experts):
-            count = expert_counts[expert_idx]
-
-            if count <= 0:
-                continue
-
-            end = start + count
-
-            expert_in = sorted_inputs[start:end]
-            expert_out = self.experts[expert_idx](expert_in)
+        packed_inputs = x_flat.new_zeros((E, max_count, hidden))
+        packed_inputs[valid_mask] = x_flat[token_ids]
 
 
-            sorted_outputs[start:end] = expert_out.to(sorted_outputs.dtype)
 
-            start = end
+        proj = torch.matmul(packed_inputs, self.w13.transpose(1, 2)) 
+        gate, up = proj.chunk(2, dim=-1)
+        expert_hidden = F.silu(gate) * up
 
-        unsorted_outputs = sorted_outputs[inverse_idx]
 
-        unsorted_outputs = unsorted_outputs.view(
-            N, self.num_experts_per_token, hidden
-        )
+        packed_outputs = torch.matmul(expert_hidden, self.w2.transpose(1, 2))
 
-        output_flat = (unsorted_outputs * topk_weights.unsqueeze(-1)).sum(dim=1)
 
-        output = output_flat.view(bsz, seq_len, hidden)
+        sorted_outputs = packed_outputs[valid_mask]
+        unsort_perm = torch.argsort(sort_perm)
+        sorted_outputs = sorted_outputs[unsort_perm]
 
+
+        sorted_outputs = sorted_outputs.view(N, K, hidden)
+        routed_out = (sorted_outputs * topk_weights.unsqueeze(-1)).sum(dim=1)
+
+        output = (shared_out + routed_out).view(bsz, seq_len, hidden)
         return output, aux_loss, z_loss, router_logits
 
 class TransformerBlock(nn.Module):
     """
-    A single Transformer layer combining Multi-Head Latent Attention (MLA) and MoE.
-
-    This block implements a pre-norm residual architecture. It utilizes Layer Scale 
-    (ls1, ls2) to weigh the residual branches, which helps stabilize deep 
-    network initialization.
+    A Transformer layer using MLA (attention) and MoE (experts).
 
     Args:
-        config (ModelConfig): Configuration object for hidden dimensions and MoE settings.
+        config (ModelConfig): Model hyperparameters.
 
     Returns:
-        tuple: A tuple containing:
-            - x (torch.Tensor): The processed hidden states [batch_size, seq_len, hidden_size].
-            - aux_loss (torch.Tensor): Load balancing loss from the MoE router.
-            - z_loss (torch.Tensor): Router stability loss (z-loss).
-            - router_logits (torch.Tensor): The raw scores for expert selection.
+        x (torch.Tensor): Updated hidden states.
+        aux_loss (torch.Tensor): Load balancing loss for the router.
+        z_loss (torch.Tensor): Stability loss to prevent logit explosion.
+        router_logits (torch.Tensor): Raw logits from the expert selection.
     """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.norm1 = RMSNorm(config)
@@ -358,16 +386,14 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
 
-        residual = x
-        x = self.norm1(x)
-        x = self.mla(x, position_ids)
-        x = residual + self.ls1 * x
+        h = self.norm1(x)
+        x = x + self.ls1 * self.mla(h, position_ids)
 
-        residual = x
-        x = self.norm2(x)
-        moe_out, aux_loss, z_loss,router_logits = self.moe(x)
-        x = residual + self.ls2 * moe_out
-        return x, aux_loss, z_loss,router_logits
+        h = self.norm2(x)
+        moe_out, aux_loss, z_loss, router_logits = self.moe(h)
+        x = x + self.ls2 * moe_out
+
+        return x, aux_loss, z_loss, router_logits
 
 class Transformer(nn.Module):
     """
@@ -423,8 +449,8 @@ class Transformer(nn.Module):
 
      
         
-        total_aux_loss = torch.tensor(0.0, device=x.device)
-        total_z_loss = torch.tensor(0.0, device=x.device)
+        total_aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        total_z_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         last_router_logits = None
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:

@@ -15,6 +15,9 @@ from model import Transformer, ModelConfig
 from data import Training_Streaming_Dataset,Eval_Streaming_Dataset
 from transformers import AutoTokenizer
 import shutil
+from safetensors.torch import load_file
+from safetensors.torch import save_model
+from typing import Tuple, Literal, Optional
 
 
 #  Authentication
@@ -92,41 +95,48 @@ class TrainConfig:
         out_dir (str): Path to the directory where checkpoints are stored.
     """
     # Optimization
-    lr = 1e-3
-    weight_decay = 0.01
-    betas = (0.9, 0.95)
-    grad_clip = 1.0
-    num_train_steps = 45776
-    warmup_steps = 2500
-    optimizer_type='8bitAdamW'
-
+    lr: float = 1e-3
+    weight_decay: float = 0.01
+    betas: Tuple[float, float] = (0.9, 0.95)
+    grad_clip: float = 1.0
+    num_train_steps: int = 30_518
+    warmup_steps: int = 2500
+    optimizer_type: Literal["default", "PagedAdamW", "8bitAdamW"] = "8bitAdamW"
+    
     # Batch / Throughput
-    micro_batch_size = 32
-    grad_accum_steps =4
-    max_seq_len = 512
-
+    micro_batch_size: int = 32
+    grad_accum_steps: int = 8
+    max_seq_len: int = 512
+    
     # Precision / Performance
-    mixed_precision = "fp16"
-    compile_model = True
-    compile_type = "default"
-
+    mixed_precision: Literal["no", "fp16", "bf16"] = "fp16"
+    
     # Memory
-    activation_checkpointing = True
-
+    activation_checkpointing: bool = True
+    turn_on_compile: bool = False ### WARNING: READ BEFORE ENABLING  torch.compile crashes evaluation logic for reasons I didn't yet discover.                              
+    compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
+    
     # MoE Stability
-    router_aux_loss_coef = 0.002
-    router_z_loss_coef = 1e-4
-    capacity_factor = 1.1
-    top_k = 2
-
+    router_aux_loss_coef: float = 0.002
+    router_z_loss_coef: float = 1e-4
+    capacity_factor: float = 1.1
+    top_k: int = 2
+    
     # Logging
-    save_interval=700
-    num_eval_steps = 50
-    eval_interval = 1000
-    save_best_model = False
-    log_interval = 20
-    out_dir = "/kaggle/working/checkpoints"
+    save_interval: int = 700
+    num_eval_steps: int = 50
+    eval_interval: int = 1000
+    save_best_model: bool = False
+    log_interval: int = 10
+    out_dir: str = "/kaggle/working/checkpoints"
 # Helper Functions 
+
+def has_checkpoint(path):
+    return (
+        os.path.exists(os.path.join(path, "model.safetensors")) or
+        os.path.exists(os.path.join(path, "pytorch_model.bin"))
+    )
+
 def prepare_checkpoint_from_dataset(cfg: TrainConfig):
     """
     Finds and copies the latest model checkpoint from a read-only dataset to the local working directory.
@@ -216,7 +226,7 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
     return loss
 
 
-
+@torch._dynamo.disable()
 def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
     """
     Evaluates the model on a validation set to compute loss and perplexity.
@@ -232,8 +242,7 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
     """
 
     model.eval()
-    model= accelerator.unwrap_model(model)
- 
+    model = accelerator.unwrap_model(model)
     data_iter = iter(val_dataloader)
     
     device = accelerator.device
@@ -316,7 +325,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="Tiny-MoE-2",
+            project_name="Tiny-MoE",
             config=vars(cfg)
         )
         
@@ -358,23 +367,18 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         print('Using 8bitAdamW')
 
 
-    base_model = model 
-    if cfg.compile_model:
-        accelerator.print("Compiling model...")
-        accelerator.print(f"Compiling Method is {cfg.compile_type}")
-        model = torch.compile(base_model,mode=cfg.compile_type,dynamic=True, fullgraph=False)
 
     model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader
     )
-
-
-    eval_model=base_model
+    
+    
     prepare_checkpoint_from_dataset(cfg)
+        
     best_loss=float("inf")
     best_step=0
     tokens_seen=0
-    model.train()
+
     step = 0
     checkpoint_dir = os.path.join(cfg.out_dir, "best")
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -383,11 +387,6 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
     regular_ckpt_dir = os.path.join(cfg.out_dir, "regular")
     os.makedirs(regular_ckpt_dir, exist_ok=True)
     
-    def has_checkpoint(path):
-        return (
-            os.path.exists(os.path.join(path, "model.safetensors")) or
-            os.path.exists(os.path.join(path, "pytorch_model.bin"))
-        )
 
     resume_path = None
     
@@ -409,9 +408,11 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                 resume_path = latest
     
 
-    if resume_path:
+    if resume_path is not None:
         accelerator.print(f"Resuming from: {resume_path}")
-        accelerator.load_state(resume_path)
+        unwrapped_model = accelerator.unwrap_model(model)
+        state_dict = load_file(os.path.join(resume_path, "model.safetensors"))
+        unwrapped_model.load_state_dict(state_dict,strict=False)
     
         meta_path = os.path.join(resume_path, "metadata.pt")
         if os.path.exists(meta_path):
@@ -428,15 +429,18 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
             )
     else:
         accelerator.print("No checkpoint found — starting from scratch.")
-    
+        
+    if cfg.turn_on_compile:
+        accelerator.print("Compiling Now...")
+        accelerator.print(f"Compiling mode is {cfg.compile_mode}")
+        model=torch.compile(model=model,mode=cfg.compile_mode,dynamic=True,fullgraph=False)
+    model.train()
     progress_bar = tqdm(total=cfg.num_train_steps,initial=step, disable=not accelerator.is_main_process)
     
     
     data_iter = iter(train_dataloader)
 
     while step < cfg.num_train_steps:
-        if cfg.compile_type == "reduce-overhead":
-            torch.compiler.cudagraph_mark_step_begin()
         step_start=time.perf_counter()
         with accelerator.accumulate(model):
             
@@ -489,9 +493,10 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                 tps = global_step_tokens / step_time
                 accelerator.wait_for_everyone()
                 if step % cfg.eval_interval == 0:
+                    
                     accelerator.print("Evaluating Now...")
                     accelerator.wait_for_everyone()
-                    val_loss, val_ppl = evaluate(eval_model, val_dataloader, cfg, accelerator)
+                    val_loss, val_ppl = evaluate(model, val_dataloader, cfg, accelerator)
                     accelerator.wait_for_everyone()
                     
                 is_best=current_loss<best_loss
@@ -503,9 +508,10 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                 if cfg.save_best_model and is_best:
                     
                     accelerator.print(f"New best loss {best_loss:.4f} at step {step} → saving...")
-                    accelerator.save_state(checkpoint_dir)
                     
                     if accelerator.is_main_process:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        save_model(unwrapped_model, os.path.join(save_path, "model.safetensors"))
                         torch.save({
                             "step": step,
                             "best_step": best_step,
@@ -515,18 +521,19 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                         }, os.path.join(checkpoint_dir, "metadata.pt"))
                         
                 if step % cfg.save_interval == 0:
-
-
                     accelerator.print(f"Saving checkpoint at step {step}...")
-                    
                     
                     accelerator.wait_for_everyone()
                     
-                    
                     save_path = os.path.join(regular_ckpt_dir, f"step_{step}")
+
+                    if accelerator.is_main_process:
+                        os.makedirs(save_path, exist_ok=True)
+                    
+
                     accelerator.save_state(save_path, safe_serialization=True)
                     
-                    
+
                     if accelerator.is_main_process:
                         torch.save({
                             "step": step,
@@ -535,10 +542,14 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                             "best_loss" : best_loss,
                             "tokens_seen": tokens_seen, 
                         }, os.path.join(save_path, "metadata.pt"))
-                        accelerator.print(f" Checkpoint saved at {save_path}")
+                
+
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        save_model(unwrapped_model, os.path.join(save_path, "clean_model.safetensors"))
+                        
+                        accelerator.print(f"Checkpoint and clean weights saved at {save_path}")
                 
                         
-
                 
                 if accelerator.is_main_process:
                     progress_bar.update(1)
@@ -564,12 +575,12 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                         "best_step": best_step,
                         "step_time": step_time,
                         "tps": tps,
-                        "peak_Vram_gb": torch.cuda.max_memory_allocated() / 1e9,
                     }
                 
                     if step % cfg.eval_interval == 0:
                         log_data["val_loss"] = val_loss
                         log_data["val_ppl"] = val_ppl
+                        
                     if "aux_loss" in outputs and outputs["aux_loss"] is not None:
                         raw_aux = outputs["aux_loss"].detach()
                         log_data["aux_loss"] = accelerator.gather(raw_aux).mean().item()
@@ -615,7 +626,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                         
                     if accelerator.is_main_process:
                      accelerator.log(log_data, step=step)
-                    torch.cuda.reset_peak_memory_stats(device)
+
 
     
                     

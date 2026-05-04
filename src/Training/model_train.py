@@ -249,71 +249,97 @@ class MLA(nn.Module):
         torch.Tensor: The attention output tensor of shape [batch, seq_len, hidden_size].
     """
 
-    def __init__(self, config: ModelConfig):
+
+    def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_dim = config.qk_nope_dim
         self.qk_rope_dim = config.qk_rope_dim
+        self.attention_factor = config.mscale
+        self.max_seq_len = config.max_seq_len
+        self.original_max_seq_len = config.original_max_seq_len
+        self.factor=config.factor
+
         self.head_dim = self.qk_nope_dim + self.qk_rope_dim
 
-   
         self.w_in = nn.Linear(self.hidden_size, 2 * self.kv_lora_rank, bias=False)
 
-        self.w_ukv = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads * self.head_dim * 2,
-            bias=False,
-        )
+
         self.w_uq_qr = nn.Linear(
             self.kv_lora_rank,
-            self.num_heads * self.head_dim + self.num_heads * self.qk_rope_dim,
+            self.num_heads * self.qk_nope_dim + self.num_heads * self.qk_rope_dim,
             bias=False,
         )
+
+
+        self.w_uk = nn.Parameter(
+            torch.empty(self.num_heads, self.qk_nope_dim, self.kv_lora_rank)
+        )
+
+
+        self.w_uv = nn.Parameter(
+            torch.empty(self.num_heads, self.kv_lora_rank, self.head_dim)
+        )
+
         self.w_kr = nn.Linear(self.hidden_size, self.qk_rope_dim, bias=False)
         self.w_o = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
         self.rope = RoPE(config)
 
+        base_scale = (self.qk_nope_dim + self.qk_rope_dim) ** -0.5
+
+        use_scaled_attention = self.max_seq_len > self.original_max_seq_len and self.attention_factor is not None
+        self.softmax_scale = base_scale * self.attention_factor if use_scaled_attention else base_scale
+
+        nn.init.xavier_uniform_(self.w_uk)
+        nn.init.xavier_uniform_(self.w_uv)
+
+
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         bsz, seq_len, _ = x.shape
 
-
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(bsz, -1)
 
         c_in = self.w_in(x)
         c_kv, c_q = c_in.split(self.kv_lora_rank, dim=-1)
 
 
-
-        kv = self.w_ukv(c_kv).reshape(bsz, seq_len, self.num_heads, 2 * self.head_dim)
-        k_nope, v = kv.chunk(2, dim=-1)
-
-
         q_proj = self.w_uq_qr(c_q).reshape(
-            bsz, seq_len, self.num_heads, self.head_dim + self.qk_rope_dim
+            bsz, seq_len, self.num_heads, self.qk_nope_dim + self.qk_rope_dim
         )
-        q_nope, q_rope = q_proj.split([self.head_dim, self.qk_rope_dim], dim=-1)
-
-
-        k_rope = self.w_kr(x).unsqueeze(2)  
-       
+        q_nope, q_rope = q_proj.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1)
         q_rope = self.rope(q_rope, position_ids)
+
+
+        q_lat = torch.einsum("bthd,hdr->bthr", q_nope, self.w_uk)
+
+
+        k_rope = self.w_kr(x).unsqueeze(2)  # [B, T, 1, rope_dim]
         k_rope = self.rope(k_rope, position_ids)
-
-
         k_rope = k_rope.expand(-1, -1, self.num_heads, -1)
 
-        q = torch.cat((q_nope, q_rope), dim=-1).transpose(1, 2)
-        k = torch.cat((k_nope, k_rope), dim=-1).transpose(1, 2)
-        v = v.transpose(1, 2)
+        k_lat = c_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+        v = c_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
 
-        attn_output = F.scaled_dot_product_attention(q, k, v,is_causal=True)
+        q = torch.cat([q_lat, q_rope], dim=-1).transpose(1, 2)  # [B, H, T, r + rope]
+        k = torch.cat([k_lat, k_rope], dim=-1).transpose(1, 2)   # [B, H, T, r + rope]
+        v = v.transpose(1, 2)                                    # [B, H, T, r]
 
-        attn_output = attn_output.transpose(1, 2).reshape(
-            bsz, seq_len, self.num_heads * self.head_dim
+        attn_lat = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            scale=self.softmax_scale,
         )
-        return self.w_o(attn_output)
+
+        attn_out = torch.einsum("bhtk,hkd->bhtd", attn_lat, self.w_uv)
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+
+        return self.w_o(attn_out)
 
 
 
@@ -405,15 +431,17 @@ class MoE(nn.Module):
 
  
         counts = torch.bincount(expert_ids, minlength=E)
-        counts = counts.to(x.device)
         max_count = counts.max()
 
+        starts = torch.repeat_interleave(
+            torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]]),
+            counts
+        )
 
-        valid_mask = torch.arange(max_count, device=x.device).unsqueeze(0) < counts.unsqueeze(1)
+        slot_ids = torch.arange(expert_ids.numel(), device=x.device) - starts
 
         packed_inputs = x_flat.new_zeros((E, max_count, hidden))
-        packed_inputs[valid_mask] = x_flat[token_ids]
-
+        packed_inputs[expert_ids, slot_ids] = x_flat[token_ids]
 
 
         proj = torch.matmul(packed_inputs, self.w13.transpose(1, 2)) 
@@ -424,16 +452,15 @@ class MoE(nn.Module):
         packed_outputs = torch.matmul(expert_hidden, self.w2.transpose(1, 2))
 
 
-        packed_outputs = torch.matmul(expert_hidden, self.w2.transpose(1, 2))
 
-        valid_outputs = packed_outputs[valid_mask]
+        valid_outputs = packed_outputs[expert_ids, slot_ids]
 
-        combined_outputs = torch.empty((N * K, hidden), device=x.device, dtype=x.dtype)
-
-        combined_outputs[sort_perm] = valid_outputs
-
-        sorted_outputs = combined_outputs.view(N, K, hidden)
-        routed_out = (sorted_outputs * topk_weights.unsqueeze(-1)).sum(dim=1)
+        routed_out = x_flat.new_zeros((N, hidden))
+        routed_out.index_add_(
+            0,
+            token_ids,
+            valid_outputs * gates.unsqueeze(-1)
+        )
         
         output = (shared_out + routed_out).view(bsz, seq_len, hidden)
     
@@ -455,22 +482,19 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.norm1 = RMSNorm(config)
-        self.mla = MLA(config)
-        self.ls1 = nn.Parameter(torch.ones(1) * 0.1)
-        self.norm2 = RMSNorm(config)
+        self.attn_norm = RMSNorm(config)
+        self.ffn_norm = RMSNorm(config)
+
+        self.attn = MLA(config)
         self.moe = MoE(config)
+
+        self.ls1 = nn.Parameter(torch.ones(1) * 0.1)
         self.ls2 = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
-
-        h = self.norm1(x)
-        x = x + self.ls1 * self.mla(h, position_ids)
-
-        h = self.norm2(x)
-        moe_out, aux_loss, z_loss, router_logits = self.moe(h)
-        x = x + self.ls2 * moe_out
-
+        h = x + self.ls1 * self.attn(self.attn_norm(x), position_ids)
+        moe_out, aux_loss, z_loss, router_logits = self.moe(self.ffn_norm(h))
+        x = h + self.ls2 * moe_out
         return x, aux_loss, z_loss, router_logits
 
 class Transformer(nn.Module):

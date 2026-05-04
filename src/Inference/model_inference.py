@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional,Dict,Any
 from torch.utils.checkpoint import checkpoint
+import math
 
 
 
@@ -13,39 +14,60 @@ from torch.utils.checkpoint import checkpoint
 @dataclass
 class ModelConfig:
     """
-    Configuration class for a DeepSeek-style MoE model with MLA.
+    Model configuration settings for the model.
 
-    Attributes:
-        vocab_size (int): Total number of tokens in the vocabulary.
-        hidden_size (int): Dimensionality of the model layers.
-        num_layers (int): Total number of transformer blocks.
-        initializer_range (float): Standard deviation for weight initialization.
-        tie_word_embeddings (bool): Whether to share weights between input and output embeddings.
-        max_seq_len (int): Maximum sequence length (context window).
+    ### General Settings
+    - vocab_size (int): Total number of tokens in the vocabulary.
+    - hidden_size (int): The main embedding dimension used across all layers.
+    - num_layers (int): The number of sequential Transformer blocks.
+    - initializer_range (float): Scale for weight initialization to ensure stable gradients.
+    - tie_word_embeddings (bool): Whether to reuse embedding weights for the final output projection.
+    - max_seq_len (int): The maximum context window size for the model.
+    - max_batch_size (int): The maximum number of sequences to process at once.
 
-        rms_norm_eps (float): Small constant added to denominator in RMSNorm for stability.
-        rope_theta (float): The base period for Rotary Positional Embeddings (RoPE).
+    ### Normalization
+    - rms_norm_eps (float): A tiny value added during RMSNorm to prevent division by zero.
 
-        # MLA (Multi-head Latent Attention)
-        num_attention_heads (int): Number of attention heads.
-        kv_lora_rank (int): The rank of the compressed KV latent vector.
-        qk_nope_dim (int): Dimension of the Non-rope part of Query/Key projections.
-        qk_rope_dim (int): Dimension of the Rotary-enabled part of Query/Key projections.
+    ### RoPE & YaRN (Positional Encoding)
+    - rope_theta (float): The base constant for rotary frequency calculations.
+    - rope_type (str): The method for context scaling (e.g., 'yarn' for long-context support).
+    - beta_slow (float): Controls the low-frequency boundary for YaRN interpolation.
+    - beta_fast (float): Controls the high-frequency boundary for YaRN interpolation.
+    - factor (float): The scaling factor for stretching the context window (e.g., 2.0 doubles the length).
+    - mscale (Optional[float]): Scaling factor for attention logits to prevent entropy collapse in long sequences.
+    - original_max_seq_len (int): The starting context length the model was originally 
+        trained on (e.g., 4096) before applying context extension techniques like YaRN.
 
-        # MoE (Mixture of Experts)
-        num_experts (int): Total number of available experts in each MoE layer.
-        num_experts_per_token (int): Number of experts activated for each token (Top-K).
-        moe_intermediate_size (int): The hidden dimension size inside each individual expert.
+    ### MLA (Multi-Head Latent Attention)
+    - num_attention_heads (int): Number of parallel attention heads.
+    - kv_lora_rank (int): The compressed dimension for KV vectors, used to minimize KV-cache memory usage.
+    - qk_nope_dim (int): The dimension of the query/key vectors that remain "Non-Positionally Encoded."
+    - qk_rope_dim (int): The dimension of the query/key vectors where RoPE is applied.
+
+    ### MoE (Mixture of Experts)
+    - num_experts (int): The total pool of expert sub-networks in each layer.
+    - num_experts_per_token (int): The "Top-K" value; how many experts are active for a single token.
+    - moe_intermediate_size (int): The hidden expansion dimension within each individual expert's FFN.
     """
     vocab_size: int = 32000
     hidden_size: int = 512
     num_layers: int = 12
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
-    max_seq_len: int = 1024
-
+    max_seq_len: int = 2048
+    max_batch_size: int = 1
+    
+    # RMSNorm
     rms_norm_eps: float = 1e-6
+    
+    # RoPE & YaRN 
     rope_theta: float = 10000.0
+    rope_type: str = "yarn"
+    beta_slow: float = 1.0
+    beta_fast: float = 32.0
+    factor: float = 4
+    original_max_seq_len: int = 512
+    mscale: Optional[float] = 1.1386
 
     # MLA
     num_attention_heads: int = 8
@@ -85,365 +107,475 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor):
         return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
+
 class RoPE(nn.Module):
     """
-    Rotary Positional Embedding (RoPE) using complex number rotation.
-
-    Applies a relative position encoding by rotating segments of the query and key
-    embeddings in complex space, allowing the model to capture relative distances
-    between tokens effectively.
+    Rotary Positional Embeddings (RoPE) with YaRN scaling support.
 
     Args:
-        config (ModelConfig): Config containing 'qk_rope_dim', 'max_seq_len', 
-                             and 'rope_theta'.
+        config (ModelConfig): Config containing rope dimensions, theta, 
+            and scaling factors for long-context extension.
 
-    Attributes:
-        freqs_cis (torch.Tensor): Precomputed complex exponential (cos + i*sin) 
-                                 cache for all possible positions up to max_seq_len.
+    Returns:
+        torch.Tensor: The input tensor with rotary position embeddings applied.
     """
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config):
         super().__init__()
+
         self.dim = config.qk_rope_dim
-        self.max_seq_len = config.max_seq_len
-        self.theta = config.rope_theta
-        freqs = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim))
+        self.max_seq_len = getattr(config, "max_seq_len", 1024)
+        self.theta = getattr(config, "rope_theta", 10000.0)
+
+        self.rope_type = getattr(config, "rope_type", "default") 
+
+  
+        self.factor = float(getattr(config, "factor", 1.0))
+        self.original_max_seq_len = int(
+            getattr(config, "original_max_seq_len", self.max_seq_len)
+        )
+        self.beta_slow = float(getattr(config, "beta_slow", 1.0))
+        self.beta_fast = float(getattr(config, "beta_fast", 32.0))
+
+
+        self.attention_factor = getattr(config, "mscale", None)
+
+        if self.dim % 2 != 0:
+            raise ValueError("qk_rope_dim must be even")
+
+        inv_freq = 1.0 / (
+            self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim)
+        )
+
+        if self.rope_type == "yarn":
+            inv_freq = self._build_yarn_inv_freq(inv_freq)
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
         t = torch.arange(self.max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, freqs)
-        self.register_buffer("freqs_cis", torch.polar(torch.ones_like(freqs), freqs), persistent=False)
+        freqs = torch.outer(t, self.inv_freq)
+        self.register_buffer(
+            "freqs_cis",
+            torch.polar(torch.ones_like(freqs), freqs),
+            persistent=False,
+        )
+
+    def _build_yarn_inv_freq(self, inv_freq: torch.Tensor) -> torch.Tensor:
+        """
+        Computes YaRN-scaled frequencies for context window extension.
+
+        Args:
+            inv_freq (torch.Tensor): Original inverse frequencies.
+
+        Returns:
+            torch.Tensor: Scaled frequencies based on the YaRN interpolation method.
+        """
+        
+        s = max(self.factor, 1.0)
+
+        if s == 1.0:
+            return inv_freq
+
+        wavelengths = 2.0 * math.pi / inv_freq
+        r = self.original_max_seq_len / wavelengths
+
+        ramp = ((r - self.beta_slow) / (self.beta_fast - self.beta_slow)).clamp(0.0, 1.0)
+
+        inv_freq_scaled = inv_freq / s
+        inv_freq_yarn = (1.0 - ramp) * inv_freq_scaled + ramp * inv_freq
+        return inv_freq_yarn
 
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
+        squeeze_head = False
+
+        if x.dim() == 3:
+            x = x.unsqueeze(2)  
+            squeeze_head = True
+        elif x.dim() != 4:
+            raise ValueError("RoPE expects x with shape [B, T, D] or [B, T, H, D]")
+
         dtype = x.dtype
-        seq_len = x.shape[1]
+        device = x.device
+        bsz, seq_len, n_heads, dim = x.shape
+
+        if dim % 2 != 0:
+            raise ValueError("RoPE dimension must be even")
+
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}. "
+                "Increase max_seq_len or extend the cache."
+            )
+
         if position_ids is None:
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=x.device)
-        freqs_cis = self.freqs_cis[:seq_len].view(1, seq_len, 1, -1)
-        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        x_rotated = x_complex * freqs_cis
-        return torch.view_as_real(x_rotated).flatten(3).to(dtype)
+            position_ids = torch.arange(seq_len, device=device, dtype=torch.long)
+        else:
+            position_ids = torch.as_tensor(position_ids, device=device, dtype=torch.long)
+
+        if position_ids.dim() == 0:
+            position_ids = position_ids.view(1)
+
+        if position_ids.dim() == 1:
+            freqs = self.freqs_cis.index_select(0, position_ids).unsqueeze(0).unsqueeze(2)
+        elif position_ids.dim() == 2:
+            if position_ids.shape != (bsz, seq_len):
+                raise ValueError("position_ids shape must match [B, T]")
+            freqs = self.freqs_cis[position_ids].unsqueeze(2)
+        else:
+            raise ValueError("position_ids must have shape [T] or [B, T]")
+
+        x_complex = torch.view_as_complex(
+            x.float().reshape(bsz, seq_len, n_heads, dim // 2, 2)
+        )
+        y = x_complex * freqs
+        y = torch.view_as_real(y).flatten(-2).to(dtype)
+
+        if squeeze_head:
+            y = y.squeeze(2)
+
+        return y
+
+
+
+
+
 
 class MLA(nn.Module):
     """
-    Multi-head Latent Attention (MLA) with KV Compression.
+    Implements Multi-Head Latent Attention (MLA) with an "Absorbed" KV-Cache for inference.
 
-    MLA reduces the KV cache size by projecting Keys and Values into a low-rank 
-    latent space (c_kv). It also separates Query/Key components into 
-    content-based (nope) and position-based (rope) vectors.
+    This optimized version caches only the low-rank latent vectors instead of full 
+    head projections. It uses einsum-based weight absorption to merge projections 
+    directly into the attention computation, significantly reducing memory bandwidth.
 
     Args:
-        config (ModelConfig): Configuration object containing hidden_size, 
-                             lora_rank, and attention dimensions.
+        config (ModelConfig): Configuration containing 'hidden_size', 'kv_lora_rank', 
+                             'qk_nope_dim', 'qk_rope_dim', and 'max_batch_size'.
 
-    Attributes:
-        w_dkv (nn.Linear): Down-projection for Keys and Values into latent space.
-        w_dq (nn.Linear): Down-projection for Queries into latent space.
-        rope (RoPE): Rotary Positional Embedding module for the 'rope' dimensions.
-        scale (float): Scaling factor for the attention scores (1/sqrt(head_dim)).
+    Returns:
+        torch.Tensor: Attended output tensor of shape [batch, seq_len, hidden_size].
     """
-    def __init__(self, config: ModelConfig):
+
+    def __init__(self, config):
         super().__init__()
+        # Note: I usually don't write comments but this one is special case
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_dim = config.qk_nope_dim
         self.qk_rope_dim = config.qk_rope_dim
+        self.attention_factor=config.mscale
+        self.max_seq_len = config.max_seq_len
+        self.original_max_seq_len = config.original_max_seq_len
+
+        # final per-head output size
         self.head_dim = self.qk_nope_dim + self.qk_rope_dim
 
-        self.w_dkv = nn.Linear(self.hidden_size, self.kv_lora_rank, bias=False)
-        self.w_dq = nn.Linear(self.hidden_size, self.kv_lora_rank, bias=False)
-        self.w_ukv = nn.Linear(self.kv_lora_rank,self.num_heads * self.head_dim * 2,  bias=False )
-        self.w_uq_qr = nn.Linear(self.kv_lora_rank,self.num_heads * self.head_dim + self.num_heads * self.qk_rope_dim,bias=False)
+        # latent attention size used by absorb path
+        self.latent_dim = self.kv_lora_rank
+
+        self.max_seq_len = config.max_seq_len
+        self.max_batch_size = config.max_batch_size
+
+        self.w_in = nn.Linear(self.hidden_size, 2 * self.kv_lora_rank, bias=False)
+
+        # query projection:
+        #   q_nope -> content branch
+        #   q_rope -> positional branch
+        self.w_uq_qr = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * self.qk_nope_dim + self.num_heads * self.qk_rope_dim,
+            bias=False,
+        )
+
+        # absorbed query-content -> latent-KV-space projection
+        # shape: [H, qk_nope_dim, kv_lora_rank]
+        self.w_uk = nn.Parameter(
+            torch.empty(self.num_heads, self.qk_nope_dim, self.kv_lora_rank)
+        )
+
+        # absorbed latent-output -> head-output projection
+        # shape: [H, kv_lora_rank, head_dim]
+        self.w_uv = nn.Parameter(
+            torch.empty(self.num_heads, self.kv_lora_rank, self.head_dim)
+        )
+
         self.w_kr = nn.Linear(self.hidden_size, self.qk_rope_dim, bias=False)
         self.w_o = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
         self.rope = RoPE(config)
+        base_scale = (self.qk_nope_dim + self.qk_rope_dim) ** -0.5
 
-    def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
-        bsz, seq_len, _ = x.shape
+        use_scaled_attention = self.max_seq_len > self.original_max_seq_len and self.attention_factor is not None
+        self.softmax_scale = base_scale * self.attention_factor if use_scaled_attention else base_scale
+        
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(self.max_batch_size, self.max_seq_len, self.kv_lora_rank),
+            persistent=False
+        )
+        self.register_buffer(
+            "pe_cache",
+            torch.zeros(self.max_batch_size, self.max_seq_len, self.qk_rope_dim),
+            persistent=False
+        )
 
+        self.cache_len = 0
 
-        c_kv = self.w_dkv(x)
-        kv = self.w_ukv(c_kv)  
-        kv = kv.view(bsz, seq_len, self.num_heads, 2 * self.head_dim)
-        k_nope, v = kv.split(self.head_dim, dim=-1)
+        # init absorbed matrices
+        nn.init.xavier_uniform_(self.w_uk)
+        nn.init.xavier_uniform_(self.w_uv)
 
+    def reset_cache(self):
+        self.cache_len = 0
 
-        c_q = self.w_dq(x)
-        q_proj = self.w_uq_qr(c_q)  
-        q_proj = q_proj.view(bsz, seq_len, self.num_heads, self.head_dim + self.qk_rope_dim)
-        q_nope, q_rope = q_proj.split([self.head_dim, self.qk_rope_dim], dim=-1)
+    @torch.inference_mode()
+    def forward(self, x, attention_mask=None):
+        B, T, _ = x.shape
 
-        k_rope = self.w_kr(x).view(bsz, seq_len, 1, self.qk_rope_dim)
+        start = self.cache_len
+        end = start + T
+        pos = torch.arange(start, end, device=x.device)
 
-        q_rope = self.rope(q_rope, position_ids)
-        k_rope = self.rope(k_rope, position_ids)
+        c_in = self.w_in(x)
+        c_kv, c_q = c_in.split(self.kv_lora_rank, dim=-1)
 
-        q = torch.cat([q_nope, q_rope], dim=-1)
-        k_rope = k_rope.repeat(1, 1, self.num_heads, 1)
-        k = torch.cat([k_nope, k_rope], dim=-1)
+        # q_nope is content branch, q_rope is positional branch
+        q_proj = self.w_uq_qr(c_q).reshape(
+            B, T, self.num_heads, self.qk_nope_dim + self.qk_rope_dim
+        )
+        q_nope, q_rope = q_proj.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1)
+        q_rope = self.rope(q_rope, pos)
 
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-        def sdpa_func(q_in, k_in, v_in):
-            return F.scaled_dot_product_attention(
-                q_in, k_in, v_in,
-                is_causal=True
-            )
+        # cache latent KV directly
+        self.kv_cache[:B, start:end] = c_kv
 
-        attn_output = sdpa_func(q, k, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.head_dim)
-        return self.w_o(attn_output)
+        # rope branch for keys
+        k_rope = self.w_kr(x).unsqueeze(2)
+        k_rope = self.rope(k_rope, pos)
+        self.pe_cache[:B, start:end] = k_rope.squeeze(2)
 
-class Expert(nn.Module):
-    """
-    A single Mixture of Experts (MoE) feed-forward block using SwiGLU activation.
+        self.cache_len = end
 
-    This block implements the Gated Linear Unit variant where the hidden 
-    representation is the element-wise product of a SiLU-activated linear 
-    projection (w1) and a gated linear projection (w3).
+        past_c_kv = self.kv_cache[:B, :end]          # [B, S, r]
+        past_pe = self.pe_cache[:B, :end]            # [B, S, d_rope]
 
-    Args:
-        config (ModelConfig): Config object with 'hidden_size' and 
-                             'moe_intermediate_size'.
+        # absorbed query-content:
+        # q_nope: [B, T, H, d_nope]
+        # w_uk:   [H, d_nope, r]
+        # q_lat:  [B, T, H, r]
+        q_lat = torch.einsum("bthd,hdr->bthr", q_nope, self.w_uk)
 
-    Attributes:
-        w1 (nn.Linear): The "gate" projection.
-        w2 (nn.Linear): The "down" projection back to hidden_size.
-        w3 (nn.Linear): The "up" projection.
-    """
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.w1 = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
-        self.w2 = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)
-        self.w3 = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
+        # attention keys use latent c_kv + rope
+        k_lat = past_c_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+        k_rope = past_pe.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+        k = torch.cat([k_lat, k_rope], dim=-1)
 
-    def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # attention queries use absorbed latent q + rope
+        q = torch.cat([q_lat, q_rope], dim=-1)
 
+        # values are latent c_kv directly
+        v = past_c_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+
+        q = q.permute(0, 2, 1, 3)   # [B, H, T, r + d_rope]
+        k = k.permute(0, 2, 1, 3)   # [B, H, S, r + d_rope]
+        v = v.permute(0, 2, 1, 3)   # [B, H, S, r]
+
+        attn_lat = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            scale=self.softmax_scale,
+            is_causal=(T > 1 and attention_mask is None),
+        )
+
+        # absorbed output projection:
+        # attn_lat: [B, H, T, r]
+        # w_uv:     [H, r, head_dim]
+        # out:      [B, H, T, head_dim]
+        attn_out = torch.einsum("bhtk,hkd->bhtd", attn_lat, self.w_uv)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, T, -1)
+
+        return self.w_o(attn_out)
+
+    
 class MoE(nn.Module):
     """
-    Sparsely Gated Mixture of Experts (MoE) Layer.
+    Implements a Mixture-of-Experts (MoE) layer with shared and routed experts.
 
-    This module implements a dynamic routing mechanism that distributes input tokens 
-    across a set of specialized expert networks. By selecting only the top-k experts 
-    per token, it increases model capacity without a linear increase in computation.
+    This module routes tokens to the top-K specialized experts while concurrently 
+    processing them through a shared expert to capture common knowledge. It 
+    includes load balancing (auxiliary loss) and stability (z-loss) mechanisms.
 
     Args:
-        config (ModelConfig): A configuration object that must have:
-            - num_experts (int): The total pool of expert networks.
-            - num_experts_per_token (int): How many experts each token is routed to.
-            - hidden_size (int): The input and output dimensionality of the tokens.
+        config (ModelConfig): Configuration containing 'num_experts', 
+                             'num_experts_per_token', and 'moe_intermediate_size'.
 
     Returns:
-        output (torch.Tensor): The aggregated result of expert processing, weighted 
-            by router probabilities. Shape: (batch_size, seq_len, hidden_size).
-        aux_loss (torch.Tensor): A load-balancing loss that penalizes over-reliance 
-            on a small subset of experts.
-        z_loss (torch.Tensor): A stability loss that discourages the router from 
-            producing extremely high-magnitude logits.
-        router_logits (torch.Tensor): The raw scores for each expert before softmax.
+        tuple: A tuple containing:
+            - output (torch.Tensor): Combined output from shared and routed experts.
+            - aux_loss (torch.Tensor): Load balancing loss for the router.
+            - z_loss (torch.Tensor): Stability loss to prevent logit explosion.
+            - router_logits (torch.Tensor): Raw logits from the expert selection.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.num_experts = config.num_experts
         self.num_experts_per_token = config.num_experts_per_token
-        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([Expert(config) for _ in range(self.num_experts)])
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
 
+        self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+
+
+        self.w13 = nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_size, self.hidden_size)
+        )
+        self.w2 = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
+        )
+        self.shared_w13 = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
+        self.shared_w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.router.weight)
+        nn.init.xavier_uniform_(self.w13)
+        nn.init.xavier_uniform_(self.w2)
+        nn.init.xavier_uniform_(self.shared_w13.weight)
+        nn.init.xavier_uniform_(self.shared_w2.weight)
+    @torch.inference_mode()
     def forward(self, x: torch.Tensor):
         bsz, seq_len, hidden = x.shape
-        x_flat = x.reshape(-1, hidden)  
+        x_flat = x.reshape(-1, hidden)
         N = x_flat.shape[0]
+        E = self.num_experts
+        K = self.num_experts_per_token
 
 
-        router_logits = self.router(x_flat)
-        router_probs = F.softmax(router_logits, dim=-1)
+        gate_up_shared = self.shared_w13(x_flat)
+        gate_s, up_s = gate_up_shared.chunk(2, dim=-1)
+        shared_out = self.shared_w2(F.silu(gate_s) * up_s)
 
 
-        z_loss = 1e-3 * torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+        router_logits = self.router(x_flat).float()
+        topk_logits, topk_indices = torch.topk(router_logits, K, dim=-1)
+        topk_weights = F.softmax(topk_logits, dim=-1)
 
+        expert_ids = topk_indices.reshape(-1)
+        token_ids = torch.arange(N, device=x.device).unsqueeze(1).expand(N, K).reshape(-1)
+        gates = topk_weights.reshape(-1)
 
-        topk_weights, topk_indices = torch.topk(
-            router_probs, self.num_experts_per_token, dim=-1
+        sort_perm = torch.argsort(expert_ids)
+        expert_ids = expert_ids[sort_perm]
+        token_ids = token_ids[sort_perm]
+        gates = gates[sort_perm]
+
+        counts = torch.bincount(expert_ids, minlength=E)
+        max_count = int(counts.max().item())
+
+        valid_mask = (
+            torch.arange(max_count, device=x.device).unsqueeze(0) < counts.unsqueeze(1)
         )
 
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
+        packed_inputs = x_flat.new_zeros((E, max_count, hidden))
+        packed_inputs[valid_mask] = x_flat[token_ids]
 
+        proj = torch.matmul(packed_inputs, self.w13.transpose(1, 2))
+        gate, up = proj.chunk(2, dim=-1)
+        expert_hidden = F.silu(gate) * up
 
-        importance = router_probs.mean(dim=0)        
-        load = router_probs.sum(dim=0)               
+        packed_outputs = torch.matmul(expert_hidden, self.w2.transpose(1, 2))
+        valid_outputs = packed_outputs[valid_mask]
 
-        load = load / (load.sum() + 1e-6)
+        routed_out = x_flat.new_zeros((N, hidden))
+        routed_out.index_add_(0, token_ids, valid_outputs * gates.unsqueeze(-1))
 
-        aux_loss = torch.sum(importance * load) * self.num_experts
-
-        token_indices = torch.arange(N, device=x.device).unsqueeze(1).expand_as(topk_indices)
-
-        flat_experts = topk_indices.reshape(-1)
-        flat_tokens = token_indices.reshape(-1)
-        flat_gates = topk_weights.reshape(-1)
-
-        sorted_idx = torch.argsort(flat_experts)
-        inverse_idx = torch.argsort(sorted_idx)
-
-        flat_experts = flat_experts[sorted_idx]
-        flat_tokens = flat_tokens[sorted_idx]
-        flat_gates = flat_gates[sorted_idx]
-
-        sorted_inputs = x_flat[flat_tokens]
-
-
-        expert_counts = torch.bincount(
-            flat_experts,
-            minlength=self.num_experts
-        )
-
-        sorted_outputs = torch.empty_like(sorted_inputs)
-
-        start = 0
-        for expert_idx in range(self.num_experts):
-            count = expert_counts[expert_idx]
-
-            if count <= 0:
-                continue
-
-            end = start + count
-
-            expert_in = sorted_inputs[start:end]
-            expert_out = self.experts[expert_idx](expert_in)
-
-
-            sorted_outputs[start:end] = expert_out.to(sorted_outputs.dtype)
-
-            start = end
-
-        unsorted_outputs = sorted_outputs[inverse_idx]
-
-        unsorted_outputs = unsorted_outputs.view(
-            N, self.num_experts_per_token, hidden
-        )
-
-        output_flat = (unsorted_outputs * topk_weights.unsqueeze(-1)).sum(dim=1)
-
-        output = output_flat.view(bsz, seq_len, hidden)
-
-        return output, aux_loss, z_loss, router_logits
-
+        output = (shared_out + routed_out).view(bsz, seq_len, hidden)
+        return output
+    
 class TransformerBlock(nn.Module):
     """
-    A single Transformer layer combining Multi-Head Latent Attention (MLA) and MoE.
+    A single Transformer layer optimized for inference.
 
-    This block implements a pre-norm residual architecture. It utilizes Layer Scale 
-    (ls1, ls2) to weigh the residual branches, which helps stabilize deep 
-    network initialization.
+    This block integrates Multi-Head Latent Attention (MLA) and a Mixture-of-Experts 
+    (MoE) layer with residual connections and RMSNorm. It is decorated with 
+    inference_mode to reduce memory overhead during generation.
 
     Args:
-        config (ModelConfig): Configuration object for hidden dimensions and MoE settings.
+        config (ModelConfig): Configuration object for layer dimensions and MoE settings.
 
     Returns:
-        tuple: A tuple containing:
-            - x (torch.Tensor): The processed hidden states [batch_size, seq_len, hidden_size].
-            - aux_loss (torch.Tensor): Load balancing loss from the MoE router.
-            - z_loss (torch.Tensor): Router stability loss (z-loss).
-            - router_logits (torch.Tensor): The raw scores for expert selection.
+        torch.Tensor: The processed hidden states of shape [batch, seq_len, hidden_size].
     """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.norm1 = RMSNorm(config)
-        self.mla = MLA(config)
-        self.ls1 = nn.Parameter(torch.ones(1) * 0.1)
-        self.norm2 = RMSNorm(config)
+        self.attn_norm = RMSNorm(config)
+        self.ffn_norm = RMSNorm(config)
+
+        self.attn = MLA(config)
         self.moe = MoE(config)
+
+        self.ls1 = nn.Parameter(torch.ones(1) * 0.1)
         self.ls2 = nn.Parameter(torch.ones(1) * 0.1)
 
-    def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
+    @torch.inference_mode()
+    def forward(self, x: torch.Tensor, position_ids=None):
+        h = x + self.ls1 * self.attn(self.attn_norm(x), position_ids)
+        x = h + self.ls2 * self.moe(self.ffn_norm(h))
+        return x
 
-        residual = x
-        x = self.norm1(x)
-        x = self.mla(x, position_ids)
-        x = residual + self.ls1 * x
-
-        residual = x
-        x = self.norm2(x)
-        moe_out, aux_loss, z_loss,router_logits = self.moe(x)
-        x = residual + self.ls2 * moe_out
-        return x, aux_loss, z_loss,router_logits
 
 class Transformer(nn.Module):
     """
-    Full MoE-MLA Transformer model.
+    The core Transformer model architecture optimized for inference and generation.
 
-    Assembles the token embeddings, a stack of MoE-enabled Transformer blocks, 
-    and the final language modeling head. Implements weight tying between 
-    embeddings and the LM head, and supports memory-efficient gradient checkpointing.
+    This class coordinates the embedding layer, a stack of TransformerBlocks (MLA + MoE), 
+    and the final language modeling head. it supports KV-cache management and 
+    optional tied embeddings.
 
     Args:
-        config (ModelConfig): Full architectural configuration including 'vocab_size', 
-                             'hidden_size', 'num_layers', and MoE-specific settings.
+        config (ModelConfig): Configuration object containing model dimensions, 
+                             layer counts, and vocabulary size.
 
     Returns:
-        dict: A dictionary containing:
-            - 'logits' (torch.Tensor): Final prediction scores for the vocabulary 
-              across the sequence [batch_size, seq_len, vocab_size].
-            - 'aux_loss' (torch.Tensor): Accumulated load-balancing loss summed 
-              from all internal MoE layers.
-            - 'z_loss' (torch.Tensor): Accumulated router stability loss summed 
-              from all internal MoE layers.
-            - 'router_logits' (torch.Tensor): The raw router scores from the 
-              very last layer in the stack.
+        torch.Tensor: Logits for the next-token prediction. If 'return_last_only' 
+                      is True, returns only the logits for the final position.
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config):
         super().__init__()
-        
         self.config = config
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_layers)])
         self.norm = RMSNorm(config)
-
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
-        self.apply(self._init_weights)
-        self.gradient_checkpointing = False
+    def reset_cache(self):
+        for layers in self.layers:
+            if hasattr(layers.attn, "reset_cache"):
+                layers.attn.reset_cache()
 
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                nn.init.zeros_(module.bias)
-                
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """Allows the trainer to enable checkpointing dynamically."""
-        self.gradient_checkpointing = True
+    @torch.inference_mode()
+    def forward(self, input_ids: torch.Tensor,  position_ids=None,return_last_only: bool = False):
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
 
-    def forward(self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         x = self.embed_tokens(input_ids)
 
-     
-        
-        total_aux_loss = torch.tensor(0.0, device=x.device)
-        total_z_loss = torch.tensor(0.0, device=x.device)
-        last_router_logits = None
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                x, aux_loss, z_loss,router_logits = checkpoint(layer, x, position_ids, use_reentrant=False)
-            else:
-                x, aux_loss, z_loss,router_logits = layer(x, position_ids)
+        for layers in self.layers:
+            x = layers(x,position_ids)
 
-            
-            last_router_logits = router_logits
-            total_aux_loss += aux_loss
-            total_z_loss += z_loss
+        x = self.norm(x)
+        if return_last_only:
+            x = x[:, -1:, :]
 
-        x=self.norm(x)
-        
         logits=self.lm_head(x)
-        
-        return {
-            "logits": logits,
-            "aux_loss": total_aux_loss,
-            "z_loss": total_z_loss,
-            "router_logits": last_router_logits
-        }
+        return logits
+    
+    

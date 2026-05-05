@@ -481,7 +481,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                 
                 token_tensor = torch.tensor(local_tokens, dtype=torch.long, device=device)
                 global_step_tokens = accelerator.reduce(token_tensor, reduction="sum").item()
-                tokens_seen += global_step_tokens
+                tokens_seen += global_step_tokens * cfg.grad_accum_steps
                 
                 lr = get_lr(step, cfg)
                 for param_group in optimizer.param_groups:

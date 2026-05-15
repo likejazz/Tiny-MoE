@@ -50,11 +50,11 @@ class ModelConfig:
     - moe_intermediate_size (int): The hidden expansion dimension within each individual expert's FFN.
     """
     vocab_size: int = 32000
-    hidden_size: int = 512
-    num_layers: int = 12
+    hidden_size: int = 1024
+    num_layers: int = 14
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
-    max_seq_len: int = 1024
+    max_seq_len: int = 512
     max_batch_size: int = 1
     
     # RMSNorm
@@ -72,11 +72,11 @@ class ModelConfig:
     # MLA
     num_attention_heads: int = 8
     kv_lora_rank: int = 128
-    qk_nope_dim: int = 32
-    qk_rope_dim: int = 32
+    qk_nope_dim: int = 64
+    qk_rope_dim: int = 64
 
     # MoE
-    num_experts: int = 8
+    num_experts: int = 16
     num_experts_per_token: int = 2
     moe_intermediate_size: int = 1024
 

@@ -12,7 +12,7 @@ import bitsandbytes as bnb
 from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login
 from model import Transformer, ModelConfig
-from data import Training_Streaming_Dataset,Eval_Streaming_Dataset
+from training.data import Training_Streaming_Dataset,Eval_Streaming_Dataset
 from transformers import AutoTokenizer
 import shutil
 from safetensors.torch import load_file

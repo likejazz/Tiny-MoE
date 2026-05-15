@@ -4,14 +4,13 @@ user_secrets = UserSecretsClient()
 hf_token = user_secrets.get_secret("HF_TOKEN") 
 
 from huggingface_hub import login
-login(token=hf_token)
 from datasets import load_dataset, interleave_datasets
 from torch.utils.data import IterableDataset,get_worker_info
 import torch
 from transformers import AutoTokenizer
 from accelerate import Accelerator
 
-
+login(token=hf_token)
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer.pad_token = tokenizer.eos_token

@@ -4,9 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional,Dict,Any
+from typing import Optional,Literal
 from torch.utils.checkpoint import checkpoint
 import math
+try:
+    from flash_attn import flash_attn_func
+    FLASH_AVAILABLE = True
+except ImportError:
+    FLASH_AVAILABLE = False
 
 
 
@@ -14,47 +19,52 @@ import math
 @dataclass
 class ModelConfig:
     """
-    Model configuration settings for the model.
-
-    ### General Settings
-    - vocab_size (int): Total number of tokens in the vocabulary.
-    - hidden_size (int): The main embedding dimension used across all layers.
-    - num_layers (int): The number of sequential Transformer blocks.
-    - initializer_range (float): Scale for weight initialization to ensure stable gradients.
-    - tie_word_embeddings (bool): Whether to reuse embedding weights for the final output projection.
-    - max_seq_len (int): The maximum context window size for the model.
-    - max_batch_size (int): The maximum number of sequences to process at once.
-
-    ### Normalization
-    - rms_norm_eps (float): A tiny value added during RMSNorm to prevent division by zero.
-
-    ### RoPE & YaRN (Positional Encoding)
-    - rope_theta (float): The base constant for rotary frequency calculations.
-    - rope_type (str): The method for context scaling (e.g., 'yarn' for long-context support).
-    - beta_slow (float): Controls the low-frequency boundary for YaRN interpolation.
-    - beta_fast (float): Controls the high-frequency boundary for YaRN interpolation.
-    - factor (float): The scaling factor for stretching the context window (e.g., 2.0 doubles the length).
-    - mscale (Optional[float]): Scaling factor for attention logits to prevent entropy collapse in long sequences.
-    - original_max_seq_len (int): The starting context length the model was originally 
-        trained on (e.g., 4096) before applying context extension techniques like YaRN.
-
-    ### MLA (Multi-Head Latent Attention)
-    - num_attention_heads (int): Number of parallel attention heads.
-    - kv_lora_rank (int): The compressed dimension for KV vectors, used to minimize KV-cache memory usage.
-    - qk_nope_dim (int): The dimension of the query/key vectors that remain "Non-Positionally Encoded."
-    - qk_rope_dim (int): The dimension of the query/key vectors where RoPE is applied.
-
-    ### MoE (Mixture of Experts)
-    - num_experts (int): The total pool of expert sub-networks in each layer.
-    - num_experts_per_token (int): The "Top-K" value; how many experts are active for a single token.
-    - moe_intermediate_size (int): The hidden expansion dimension within each individual expert's FFN.
+    Model architecture configuration for a MoE language model with MLA attention.
+    
+    Core
+    ----
+    vocab_size              : Number of tokens in the vocabulary.
+    hidden_size             : Embedding and hidden state dimension across all layers.
+    num_layers              : Number of transformer decoder layers.
+    initializer_range       : Std dev for weight initialization.
+    tie_word_embeddings     : Shares weights between input embeddings and output projection.
+    max_seq_len             : Maximum sequence length the model can process.
+    max_batch_size          : Maximum batch size for static KV-cache allocation.
+    
+    RMSNorm
+    -------
+    rms_norm_eps            : Small epsilon added for numerical stability in RMSNorm.
+    
+    RoPE & YaRN
+    -----------
+    rope_theta              : Base frequency controlling how fast RoPE rotations decay.
+    rope_type               : Positional encoding variant — "yarn" enables context extension.
+    beta_slow               : YaRN low-frequency interpolation boundary.
+    beta_fast               : YaRN high-frequency interpolation boundary.
+    factor                  : YaRN scale factor for extending beyond the training context.
+    mscale                  : YaRN magnitude scaling; inferred automatically if None.
+    original_max_seq_len    : The sequence length the model was originally trained on.
+    
+    MLA (Multi-head Latent Attention)
+    ----------------------------------
+    num_attention_heads     : Number of query heads.
+    kv_lora_rank            : Rank of the low-rank KV compression — smaller means less KV cache memory.
+    qk_nope_dim             : Per-head dimension for the non-positional (NoPE) query/key path.
+    qk_rope_dim             : Per-head dimension for the rotary-encoded query/key path.
+    attn_impl               : Attention backend — "flash_attn" is faster and more memory efficient.
+    
+    MoE (Mixture of Experts)
+    ------------------------
+    num_experts             : Total number of experts in each MoE FFN layer.
+    num_experts_per_token   : How many experts each token is routed to.
+    moe_intermediate_size   : Hidden dimension inside each expert's FFN.
     """
     vocab_size: int = 32000
-    hidden_size: int = 512
-    num_layers: int = 12
+    hidden_size: int = 768
+    num_layers: int = 16
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
-    max_seq_len: int = 2048
+    max_seq_len: int = 512
     max_batch_size: int = 1
     
     # RMSNorm
@@ -62,24 +72,24 @@ class ModelConfig:
     
     # RoPE & YaRN 
     rope_theta: float = 10000.0
-    rope_type: str = "yarn"
+    rope_type: str = "default"
     beta_slow: float = 1.0
     beta_fast: float = 32.0
-    factor: float = 4
+    factor: float = 1.0
+    mscale: Optional[float] = None
     original_max_seq_len: int = 512
-    mscale: Optional[float] = 1.1386
 
     # MLA
     num_attention_heads: int = 8
     kv_lora_rank: int = 128
-    qk_nope_dim: int = 32
+    qk_nope_dim: int = 64
     qk_rope_dim: int = 32
+    attn_impl: Literal["sdpa", "flash_attn"] = "sdpa"
 
     # MoE
     num_experts: int = 8
     num_experts_per_token: int = 2
     moe_intermediate_size: int = 1024
-
 
 
 
@@ -257,7 +267,6 @@ class MLA(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        # Note: I usually don't write comments but this one is special case
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.kv_lora_rank = config.kv_lora_rank
@@ -266,11 +275,12 @@ class MLA(nn.Module):
         self.attention_factor=config.mscale
         self.max_seq_len = config.max_seq_len
         self.original_max_seq_len = config.original_max_seq_len
+        self.attn_impl=config.attn_impl
+        self.flash_available = FLASH_AVAILABLE
 
-        # final per-head output size
         self.head_dim = self.qk_nope_dim + self.qk_rope_dim
 
-        # latent attention size used by absorb path
+
         self.latent_dim = self.kv_lora_rank
 
         self.max_seq_len = config.max_seq_len
@@ -278,23 +288,19 @@ class MLA(nn.Module):
 
         self.w_in = nn.Linear(self.hidden_size, 2 * self.kv_lora_rank, bias=False)
 
-        # query projection:
-        #   q_nope -> content branch
-        #   q_rope -> positional branch
+
         self.w_uq_qr = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * self.qk_nope_dim + self.num_heads * self.qk_rope_dim,
             bias=False,
         )
 
-        # absorbed query-content -> latent-KV-space projection
-        # shape: [H, qk_nope_dim, kv_lora_rank]
+
         self.w_uk = nn.Parameter(
             torch.empty(self.num_heads, self.qk_nope_dim, self.kv_lora_rank)
         )
 
-        # absorbed latent-output -> head-output projection
-        # shape: [H, kv_lora_rank, head_dim]
+
         self.w_uv = nn.Parameter(
             torch.empty(self.num_heads, self.kv_lora_rank, self.head_dim)
         )
@@ -321,7 +327,7 @@ class MLA(nn.Module):
 
         self.cache_len = 0
 
-        # init absorbed matrices
+
         nn.init.xavier_uniform_(self.w_uk)
         nn.init.xavier_uniform_(self.w_uv)
 
@@ -330,72 +336,74 @@ class MLA(nn.Module):
 
     @torch.inference_mode()
     def forward(self, x, attention_mask=None):
-        B, T, _ = x.shape
+        bsz, seq_len, _ = x.shape
 
         start = self.cache_len
-        end = start + T
+        end = start + seq_len
         pos = torch.arange(start, end, device=x.device)
 
         c_in = self.w_in(x)
         c_kv, c_q = c_in.split(self.kv_lora_rank, dim=-1)
 
-        # q_nope is content branch, q_rope is positional branch
+
         q_proj = self.w_uq_qr(c_q).reshape(
-            B, T, self.num_heads, self.qk_nope_dim + self.qk_rope_dim
+            bsz, seq_len, self.num_heads, self.qk_nope_dim + self.qk_rope_dim
         )
         q_nope, q_rope = q_proj.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1)
         q_rope = self.rope(q_rope, pos)
 
-        # cache latent KV directly
-        self.kv_cache[:B, start:end] = c_kv
 
-        # rope branch for keys
+        self.kv_cache[:bsz, start:end] = c_kv
+
         k_rope = self.w_kr(x).unsqueeze(2)
         k_rope = self.rope(k_rope, pos)
-        self.pe_cache[:B, start:end] = k_rope.squeeze(2)
+        self.pe_cache[:bsz, start:end] = k_rope.squeeze(2)
 
         self.cache_len = end
 
-        past_c_kv = self.kv_cache[:B, :end]          # [B, S, r]
-        past_pe = self.pe_cache[:B, :end]            # [B, S, d_rope]
+        past_c_kv = self.kv_cache[:bsz, :end]          
+        past_pe = self.pe_cache[:bsz, :end]            
 
-        # absorbed query-content:
-        # q_nope: [B, T, H, d_nope]
-        # w_uk:   [H, d_nope, r]
-        # q_lat:  [B, T, H, r]
         q_lat = torch.einsum("bthd,hdr->bthr", q_nope, self.w_uk)
 
-        # attention keys use latent c_kv + rope
+
         k_lat = past_c_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
         k_rope = past_pe.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
-        k = torch.cat([k_lat, k_rope], dim=-1)
+        
 
-        # attention queries use absorbed latent q + rope
+  
         q = torch.cat([q_lat, q_rope], dim=-1)
-
-        # values are latent c_kv directly
+        k = torch.cat([k_lat, k_rope], dim=-1)
         v = past_c_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
 
-        q = q.permute(0, 2, 1, 3)   # [B, H, T, r + d_rope]
-        k = k.permute(0, 2, 1, 3)   # [B, H, S, r + d_rope]
-        v = v.permute(0, 2, 1, 3)   # [B, H, S, r]
+        if self.attn_impl == "sdpa":
 
-        attn_lat = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask,
-            scale=self.softmax_scale,
-            is_causal=(T > 1 and attention_mask is None),
-        )
-
-        # absorbed output projection:
-        # attn_lat: [B, H, T, r]
-        # w_uv:     [H, r, head_dim]
-        # out:      [B, H, T, head_dim]
+            q_ = q.transpose(1, 2)
+            k_ = k.transpose(1, 2)
+            v_ = v.transpose(1, 2)
+        
+            attn_lat = F.scaled_dot_product_attention(
+                q_,
+                k_,
+                v_,
+                is_causal=(seq_len > 1 and attention_mask is None),
+                scale=self.softmax_scale,
+            )  
+        
+        elif self.attn_impl == "flash_attn" and self.FLASH_AVAILABLE:
+            
+            attn_lat = flash_attn_func(
+                q,
+                k,
+                v,
+                causal=(seq_len > 1 and attention_mask is None),
+                softmax_scale=self.softmax_scale,
+            )  
+            attn_lat = attn_lat.transpose(1, 2)  
+        
         attn_out = torch.einsum("bhtk,hkd->bhtd", attn_lat, self.w_uv)
-        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, T, -1)
-
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        
         return self.w_o(attn_out)
 
     
@@ -458,13 +466,13 @@ class MoE(nn.Module):
         shared_out = self.shared_w2(F.silu(gate_s) * up_s)
 
 
-        router_logits = self.router(x_flat).float()
+        router_logits = self.router(x_flat).to(torch.float32)  
         topk_logits, topk_indices = torch.topk(router_logits, K, dim=-1)
         topk_weights = F.softmax(topk_logits, dim=-1)
 
         expert_ids = topk_indices.reshape(-1)
         token_ids = torch.arange(N, device=x.device).unsqueeze(1).expand(N, K).reshape(-1)
-        gates = topk_weights.reshape(-1)
+        gates = topk_weights.reshape(-1).to(x_flat.dtype) 
 
         sort_perm = torch.argsort(expert_ids)
         expert_ids = expert_ids[sort_perm]
@@ -472,7 +480,7 @@ class MoE(nn.Module):
         gates = gates[sort_perm]
 
         counts = torch.bincount(expert_ids, minlength=E)
-        max_count = int(counts.max().item())
+        max_count = counts.max()
 
         valid_mask = (
             torch.arange(max_count, device=x.device).unsqueeze(0) < counts.unsqueeze(1)

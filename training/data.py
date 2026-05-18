@@ -4,13 +4,14 @@ user_secrets = UserSecretsClient()
 hf_token = user_secrets.get_secret("HF_TOKEN") 
 
 from huggingface_hub import login
+login(token=hf_token)
 from datasets import load_dataset, interleave_datasets
 from torch.utils.data import IterableDataset,get_worker_info
 import torch
 from transformers import AutoTokenizer
 from accelerate import Accelerator
 
-login(token=hf_token)
+
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer.pad_token = tokenizer.eos_token
@@ -51,22 +52,28 @@ class Training_Streaming_Dataset(IterableDataset):
         )
 
         ds_cosmopedia_web = load_dataset(
-            "HuggingFaceTB/cosmopedia",
-            name="web_samples_v1",
+            "HuggingFaceTB/smollm-corpus",
+            name="cosmopedia-v2",
             split="train",
             streaming=True,
         )
-
         ds_math = load_dataset(
             "open-web-math/open-web-math",
             split="train",
             streaming=True,
         )
+        
+        ds_wiki = load_dataset(
+            "wikimedia/wikipedia",
+            "20231101.en",
+            split="train",
+            streaming=True,
+        )
 
         raw_mixed = interleave_datasets(
-            [ds_web, ds_cosmopedia_web, ds_math],
-            probabilities=[0.60, 0.25, 0.15],
-            stopping_strategy="first_exhausted",
+            [ds_web, ds_cosmopedia_web, ds_math,ds_wiki],
+            probabilities=[0.57, 0.23, 0.14, 0.06],
+            stopping_strategy="all_exhausted",
             seed=seed,
         )
 
@@ -157,13 +164,12 @@ class Eval_Streaming_Dataset(IterableDataset):
             self.eval_samples=eval_samples
         
             ds_val = load_dataset(
-                "wikitext",
-                "wikitext-103-v1",
+                "allenai/c4",
+                "en",
                 split="validation",
                 streaming=True,
             )
             self.evaldataset=ds_val
-        
     def __iter__(self):
         
 

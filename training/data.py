@@ -5,44 +5,58 @@ hf_token = user_secrets.get_secret("HF_TOKEN")
 
 from huggingface_hub import login
 login(token=hf_token)
-from datasets import load_dataset, interleave_datasets
-from torch.utils.data import IterableDataset,get_worker_info
-import torch
 from transformers import AutoTokenizer
-from accelerate import Accelerator
+from datasets import load_dataset, interleave_datasets
+from torch.utils.data import IterableDataset, get_worker_info
+import torch
+import torch.distributed as dist
+
 
 
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer.pad_token = tokenizer.eos_token
-seed=3
 
 class Training_Streaming_Dataset(IterableDataset):
     """
-    An efficient streaming dataset that interleaves multiple sources and packs tokens.
+    Streaming pretraining dataset that mixes multiple corpora, shards them across
+    distributed workers, and packs contiguous token windows for next-token LM.
 
-    This class mixes data from three major sources (Web, Code, and Math) and 
-    shards that stream across distributed workers. It concatenates tokenized 
-    text into a continuous stream and yields chunks of 'max_seq_len'.
+    The dataset:
+    - streams from several Hugging Face sources,
+    - interleaves them with fixed sampling probabilities,
+    - applies buffer-based shuffling for approximate randomness,
+    - shards the stream across ranks and DataLoader workers,
+    - concatenates tokenized text into a continuous token buffer,
+    - emits fixed-length training chunks of size `max_seq_len`.
 
-    Args:
-        config (ModelConfig): Configuration object containing 'max_seq_len'.
-        tokenizer (PreTrainedTokenizer): The tokenizer used to process raw text 
-                                         and provide the 'eos_token_id'.
+    Parameters
+    ----------
+    config : ModelConfig
+        Configuration object containing at least `max_seq_len`.
+    tokenizer : PreTrainedTokenizer
+        Tokenizer used to convert raw text into token IDs.
+    seed : int
+        Base seed for interleaving and shuffling.
+    shuffle_buffer_size : int, optional
+        Buffer size used by the streaming shuffle. Larger values improve mixing
+        at the cost of more RAM. Default is 50_000.
 
-    Yields:
-        dict: A dictionary containing:
-            - 'input_ids' (torch.Tensor): A full chunk of tokens of length max_seq_len.
-            - 'position_ids' (torch.Tensor): Sequential indices [0, ..., max_seq_len-1].
-            - 'labels' (torch.Tensor): Identical to input_ids for next-token prediction.
+    Yields
+    ------
+    dict
+        Dictionary with:
+        - input_ids: torch.LongTensor of shape [max_seq_len]
+        - position_ids: torch.LongTensor of shape [max_seq_len]
+        - labels: torch.LongTensor of shape [max_seq_len]
     """
 
-
-    def __init__(self, config, tokenizer):
+    def __init__(self, config, tokenizer, seed: int, shuffle_buffer_size: int = 50_000):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_seq_len = config.max_seq_len
-
+        self.seed = seed
+        self.shuffle_buffer_size = shuffle_buffer_size
 
         ds_web = load_dataset(
             "HuggingFaceFW/fineweb-edu",
@@ -57,12 +71,13 @@ class Training_Streaming_Dataset(IterableDataset):
             split="train",
             streaming=True,
         )
+
         ds_math = load_dataset(
             "open-web-math/open-web-math",
             split="train",
             streaming=True,
         )
-        
+
         ds_wiki = load_dataset(
             "wikimedia/wikipedia",
             "20231101.en",
@@ -70,23 +85,25 @@ class Training_Streaming_Dataset(IterableDataset):
             streaming=True,
         )
 
-        raw_mixed = interleave_datasets(
-            [ds_web, ds_cosmopedia_web, ds_math,ds_wiki],
+        mixed = interleave_datasets(
+            [ds_web, ds_cosmopedia_web, ds_math, ds_wiki],
             probabilities=[0.57, 0.23, 0.14, 0.06],
             stopping_strategy="all_exhausted",
             seed=seed,
         )
 
-
-        raw_mixed = raw_mixed.shuffle(seed=seed)
-        self.traindataset=raw_mixed
-
-    
+        self.stream = mixed.shuffle(
+            seed=seed,
+            buffer_size=shuffle_buffer_size,
+        )
 
     def __iter__(self):
-        accelerator = Accelerator()
-        process_index = accelerator.process_index
-        num_processes = accelerator.num_processes
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
 
         worker_info = get_worker_info()
         if worker_info is None:
@@ -96,16 +113,20 @@ class Training_Streaming_Dataset(IterableDataset):
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
 
+        global_worker_id = rank * num_workers + worker_id
+        total_shards = world_size * num_workers
 
-        global_worker_id = process_index * num_workers + worker_id
-        total_shards = num_processes * num_workers
-
-        iterator = self.traindataset.shard(
+        iterator = self.stream.shard(
             num_shards=total_shards,
             index=global_worker_id,
         )
 
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is None:
+            raise ValueError("tokenizer.eos_token_id must be defined for streaming packing.")
+
         token_buffer = []
+
         for example in iterator:
             text = (
                 example.get("text")
@@ -120,92 +141,119 @@ class Training_Streaming_Dataset(IterableDataset):
                 add_special_tokens=False,
             )["input_ids"]
 
-            tokens.append(self.tokenizer.eos_token_id)
+            tokens.append(eos_id)
             token_buffer.extend(tokens)
 
             while len(token_buffer) >= self.max_seq_len + 1:
-                full_chunk = token_buffer[: self.max_seq_len + 1]
-                input_ids = torch.tensor(full_chunk[:-1], dtype=torch.long)
-                labels = torch.tensor(full_chunk[1:], dtype=torch.long)
-                position_ids = torch.arange(self.max_seq_len, dtype=torch.long)
+                window = token_buffer[: self.max_seq_len + 1]
 
                 yield {
-                    "input_ids": input_ids,
-                    "position_ids": position_ids,
-                    "labels": labels,
+                    "input_ids": torch.tensor(window[:-1], dtype=torch.long),
+                    "position_ids": torch.arange(self.max_seq_len, dtype=torch.long),
+                    "labels": torch.tensor(window[1:], dtype=torch.long),
                 }
 
                 token_buffer = token_buffer[self.max_seq_len:]
 
+
 class Eval_Streaming_Dataset(IterableDataset):
     """
-    A streaming dataset for model evaluation using Wikitext-103.
+    Deterministic streaming evaluation dataset that reads a fixed number of raw
+    examples, shards them across distributed workers, and packs contiguous token
+    windows for next-token LM evaluation.
 
-    This class loads the validation split of Wikitext, takes a fixed number 
-    of samples, and packs them into continuous chunks of 'max_seq_len'.
+    The dataset:
+    - streams from the validation split of C4,
+    - takes a fixed number of raw examples,
+    - shards that fixed window across ranks and DataLoader workers,
+    - concatenates tokenized text into a continuous buffer,
+    - yields packed sequences of length `max_seq_len`.
 
-    Args:
-        config (ModelConfig): Configuration containing 'max_seq_len'.
-        tokenizer (PreTrainedTokenizer): The tokenizer used to process raw text.
-        eval_samples (int): The specific number of raw samples to take from 
-                           the validation stream.
+    Parameters
+    ----------
+    config : ModelConfig
+        Configuration object containing at least `max_seq_len`.
+    tokenizer : PreTrainedTokenizer
+        Tokenizer used to convert raw text into token IDs.
+    eval_samples : int
+        Number of raw validation examples to consume before packing.
 
-    Yields:
-        dict: A dictionary containing:
-            - 'input_ids' (torch.Tensor): A full chunk of tokens of length max_seq_len.
-            - 'position_ids' (torch.Tensor): Sequential indices [0, ..., max_seq_len-1].
-            - 'labels' (torch.Tensor): Identical to input_ids for next-token prediction.
+    Yields
+    ------
+    dict
+        Dictionary with:
+        - input_ids: torch.LongTensor of shape [max_seq_len]
+        - position_ids: torch.LongTensor of shape [max_seq_len]
+        - labels: torch.LongTensor of shape [max_seq_len]
     """
 
-    def __init__ (self, config, tokenizer,eval_samples : int):
-            super().__init__()
-            self.tokenizer = tokenizer
-            self.max_seq_len = config.max_seq_len
-            self.eval_samples=eval_samples
-        
-            ds_val = load_dataset(
-                "allenai/c4",
-                "en",
-                split="validation",
-                streaming=True,
-            )
-            self.evaldataset=ds_val
+    def __init__(self, config, tokenizer, eval_samples: int):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_seq_len = config.max_seq_len
+        self.eval_samples = eval_samples
+
+        self.stream = load_dataset(
+            "allenai/c4",
+            "en",
+            split="validation",
+            streaming=True,
+        )
+
     def __iter__(self):
-        
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
 
-            iterator = self.evaldataset.take(self.eval_samples)
+        worker_info = get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
 
+        global_worker_id = rank * num_workers + worker_id
+        total_shards = world_size * num_workers
 
-            token_buffer = []
-            for example in iterator:
-                text = (
-                    example.get("text")
-                    or example.get("content")
-                    or example.get("article")
-                    or str(example)
-                )
+        iterator = self.stream.take(self.eval_samples).shard(
+            num_shards=total_shards,
+            index=global_worker_id,
+        )
 
-                tokens = self.tokenizer(
-                    text,
-                    truncation=False,
-                    add_special_tokens=False,
-                )["input_ids"]
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is None:
+            raise ValueError("tokenizer.eos_token_id must be defined for streaming packing.")
 
-                tokens.append(self.tokenizer.eos_token_id)
-                token_buffer.extend(tokens)
+        token_buffer = []
 
-                while len(token_buffer) >= self.max_seq_len + 1:
-                    full_chunk = token_buffer[: self.max_seq_len + 1]
-                    input_ids = torch.tensor(full_chunk[:-1], dtype=torch.long)
-                    labels = torch.tensor(full_chunk[1:], dtype=torch.long)
-                    position_ids = torch.arange(self.max_seq_len, dtype=torch.long)
+        for example in iterator:
+            text = (
+                example.get("text")
+                or example.get("content")
+                or example.get("article")
+                or str(example)
+            )
 
-                    yield {
-                        "input_ids": input_ids,
-                        "position_ids": position_ids,
-                        "labels": labels,
-                    }
+            tokens = self.tokenizer(
+                text,
+                truncation=False,
+                add_special_tokens=False,
+            )["input_ids"]
 
-                    token_buffer = token_buffer[self.max_seq_len:]
-            
-        
+            tokens.append(eos_id)
+            token_buffer.extend(tokens)
+
+            while len(token_buffer) >= self.max_seq_len + 1:
+                window = token_buffer[: self.max_seq_len + 1]
+
+                yield {
+                    "input_ids": torch.tensor(window[:-1], dtype=torch.long),
+                    "position_ids": torch.arange(self.max_seq_len, dtype=torch.long),
+                    "labels": torch.tensor(window[1:], dtype=torch.long),
+                }
+
+                token_buffer = token_buffer[self.max_seq_len:]

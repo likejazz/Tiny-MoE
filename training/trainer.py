@@ -158,7 +158,7 @@ class TrainConfig:
     top_k: int = 2
     
     # Logging
-    save_interval: int = 700
+    save_interval: int = 500
     num_eval_steps: int = 50
     eval_interval: int = 1000
     log_interval: int = 5
@@ -516,7 +516,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
     )
 
     
-    # prepare_checkpoint_from_dataset(cfg)
+    prepare_checkpoint_from_dataset(cfg)
         
     best_loss=float("inf")
     best_step=0
@@ -579,23 +579,18 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         
     model.train()
     progress_bar = tqdm(total=cfg.num_train_steps,initial=step, disable=not accelerator.is_main_process)
-    
-    if resume_path is not None and step > 0:
-        accelerator.print(f"Skipping first {step} batches...")
-        train_dataloader = accelerator.skip_first_batches(train_dataloader, step)
-        accelerator.print(f"Done skipping.")
-    
     data_iter = iter(train_dataloader) 
 
     while step < cfg.num_train_steps:
         step_start=time.perf_counter()
-        with accelerator.accumulate(model):
+        
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(train_dataloader)
+            batch = next(data_iter)
             
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_dataloader)
-                batch = next(data_iter)
+        with accelerator.accumulate(model):
             local_tokens = batch["input_ids"].numel()
             input_ids = batch["input_ids"].to(device,non_blocking=True)
             
@@ -654,18 +649,18 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                         
                 if step % cfg.save_interval == 0:
                     accelerator.print(f"Saving checkpoint at step {step}...")
-                    
                     accelerator.wait_for_everyone()
                     
                     save_path = os.path.join(regular_ckpt_dir, f"step_{step}")
-
                     if accelerator.is_main_process:
                         os.makedirs(save_path, exist_ok=True)
                     
-
+  
                     accelerator.save_state(save_path, safe_serialization=True)
                     
 
+                    state_dict = accelerator.get_state_dict(model, unwrap=True)
+                    
                     if accelerator.is_main_process:
                         torch.save({
                             "step": step,
@@ -674,24 +669,33 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                             "best_loss" : best_loss,
                             "tokens_seen": tokens_seen, 
                         }, os.path.join(save_path, "metadata.pt"))
-                
-
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        state_dict = {
-                            k.replace("_orig_mod.", ""): v
-                            for k, v in unwrapped_model.state_dict().items()
-                        }
-                        seen = {}
-                        clean_state_dict = {}
-                        for name, tensor in state_dict.items():
-                            ptr = tensor.storage().data_ptr()
-                            if ptr not in seen:
-                                seen[ptr] = name
-                                clean_state_dict[name] = tensor
-                
-                        save_file(clean_state_dict, os.path.join(save_path, "model.safetensors"))
                         
-                        accelerator.print(f"Checkpoint and clean weights saved at {save_path}")
+
+                        clean_state_dict = {}
+                        pointer_map = {}
+                        
+                        for key, tensor in state_dict.items():
+
+                            clean_key = key.replace("_orig_mod.", "").replace("module.", "")
+                            
+                            if not tensor.is_contiguous():
+                                tensor = tensor.contiguous()
+                                
+                            ptr = tensor.data_ptr()
+                            
+                            if ptr in pointer_map:
+
+                                clean_state_dict[clean_key] = tensor.clone()
+                                accelerator.print(f"Untying Cloned shared storage for key: {clean_key}")
+                            else:
+                                pointer_map[ptr] = clean_key
+                                clean_state_dict[clean_key] = tensor
+                        
+
+                        save_file(clean_state_dict, os.path.join(save_path, "model.safetensors"))
+                        accelerator.print(f"checkpoint successfully saved at {save_path}")
+                        
+                    accelerator.wait_for_everyone()
                 
                         
                 
@@ -790,7 +794,7 @@ if __name__ == "__main__":
     config = ModelConfig()
     model = Transformer(config)
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-    train_dataset = Training_Streaming_Dataset(config, tokenizer)
+    train_dataset = Training_Streaming_Dataset(config, tokenizer,seed = 800813,shuffle_buffer_size = 50_000)
     train_dataloader = DataLoader(train_dataset, 
                             batch_size=cfg.micro_batch_size,
                             drop_last=True,
@@ -800,7 +804,7 @@ if __name__ == "__main__":
                             pin_memory=True)
     val_dataset = Eval_Streaming_Dataset(config, 
                                          tokenizer,
-                                         eval_samples=2000)
+                                         eval_samples=5000)
     val_dataloader = DataLoader(
                         val_dataset,
                         batch_size=cfg.micro_batch_size,

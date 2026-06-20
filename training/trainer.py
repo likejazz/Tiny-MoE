@@ -1,4 +1,3 @@
-#  Imports
 import os
 import time
 import math
@@ -8,427 +7,14 @@ from torch.utils.data import DataLoader
 from accelerate import Accelerator,DeepSpeedPlugin
 from tqdm import tqdm
 import bitsandbytes as bnb
-from kaggle_secrets import UserSecretsClient
-from huggingface_hub import login
-from model import Transformer, ModelConfig
+from model import Transformer
 from data import Training_Streaming_Dataset,Eval_Streaming_Dataset
 from transformers import AutoTokenizer
-import shutil
-from safetensors.torch import load_file,save_file,save_model
-from typing import Tuple, Literal, Optional,Dict,Any
+from safetensors.torch import save_file
+from helpers import build_deepspeed_config,has_checkpoint,prepare_checkpoint_from_dataset,get_lr,compute_loss,evaluate,build_accelerator
+from TrainingConfigs import TrainConfig,ModelConfig
 
 
-#  Authentication
-from kaggle_secrets import UserSecretsClient
-from huggingface_hub import login
-import wandb
-
-user_secrets = UserSecretsClient()
-hf_token = user_secrets.get_secret("HF_TOKEN") 
-login(token=hf_token)
-
-wandb_key = user_secrets.get_secret("WANDB_API_KEY")
-
-
-
-
-
-
-
-
-
-
-"""
-Hardware & Backend Initialization:
-- Disables NCCL P2P/IB to prevent hangs in specific distributed environments (like Kaggle/Colab).
-- Optimizes CUDA memory fragmentation using expandable segments.
-- Enables Flash Attention and high-precision matmuls for faster training.
-"""
-# Networking Workarounds (fixes 'NCCL timeout' or 'P2P' errors)
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_IB_DISABLE"] = "1"
-
-# Memory Management (prevents OOM by managing fragmented chunks)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
-# Backend & Logging Stability
-os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1"
-os.environ["WANDB_START_METHOD"] = "thread"
-# Attention Kernel Selection (Flash Attention > Memory Efficient > Math)
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(False)   
-# Tensor Core Optimization (Balances speed and numerical precision)
-torch.set_float32_matmul_precision('high')
-
-
-class TrainConfig:
-    """
-    Training Configuration.
-    
-    Optimization
-    ------------
-    lr                  : How fast the model learns. Too high = unstable, too low = slow.
-    weight_decay        : Gently penalizes large weights to prevent overfitting.
-    betas               : How much the optimizer trusts recent vs. past gradients (β₁, β₂).
-    grad_clip           : Prevents exploding gradients by capping their max norm.
-    num_train_steps     : How long to train for.
-    warmup_steps        : Eases the LR from 0 up slowly before the main schedule kicks in.
-    optimizer_type      : Which optimizer to use — "8bitAdamW" saves a lot of GPU memory.
-    
-    Batch / Throughput
-    ------------------
-    micro_batch_size    : How many samples are processed at once on a single device.
-    grad_accum_steps    : Simulates a larger batch by accumulating gradients before updating.
-    max_seq_len         : Longest sequence the model sees during training.
-    
-    Precision
-    ---------
-    mixed_precision     : Use "bf16" on modern GPUs for stability, "fp16" otherwise.
-    
-    Memory
-    ------
-    activation_checkpointing : Trades a bit of compute to use significantly less memory.
-    compile_model            : Fuses ops for faster training.Can be unstable, use with caution.
-    compile_mode             : How hard torch.compile tries to optimize — "max-autotune" is slowest to start but fastest to run.
-    
-    MoE Stability
-    -------------
-    router_aux_loss_coef : Nudges the router to spread tokens evenly across experts.
-    router_z_loss_coef   : Stops the router from becoming overconfident, keeps logits small.
-    capacity_factor      : How many extra tokens each expert can take before dropping the rest.
-    top_k                : How many experts each token gets sent to.
-    
-    Logging & Checkpointing
-    -----------------------
-    save_interval   : How often to save a checkpoint (in eval intervals).
-    num_eval_steps  : How many batches to run when evaluating.
-    eval_interval   : How often to evaluate (in training steps).
-    log_interval    : How often to print metrics.
-    out_dir         : Where checkpoints get saved.
-    
-    DeepSpeed (ZeRO)
-    ----------------
-    deepspeed_enabled           : Turns on DeepSpeed for distributed training.
-    wall_clock_breakdown        : Prints DeepSpeed timing internals for profiling.
-    zero_stage                  : Controls how aggressively ZeRO shards model state across GPUs.
-    overlap_comm                : Hides communication latency by overlapping it with computation.
-    contiguous_gradients        : Packs gradients together to reduce memory fragmentation.
-    reduce_bucket_size          : Controls gradient reduction bucket size.
-    allgather_bucket_size       : Controls parameter all-gather bucket size.
-    allgather_partitions        : Rebuilds sharded parameters using all-gather operations.
-    reduce_scatter              : Uses reduce-scatter for gradient synchronization.
-    offload_optimizer           : Moves optimizer state and updates to CPU memory.
-    offload_param               : Moves model parameters to CPU memory.
-    partition_activations       : Splits activation checkpoints across GPUs to save memory.
-    cpu_checkpointing           : Stores activation checkpoints in CPU memory.
-    contiguous_memory_optimization : Keeps checkpoint memory contiguous and defragmented.
-    num_checkpoints             : Sets how many activation checkpoints are tracked.
-    loss_scale_window           : Controls fp16 dynamic loss scale adjustment timing.
-    moe_enabled                 : Enables Mixture-of-Experts training.
-    ep_size                     : Sets the expert parallel group size.
-    moe_param_group             : Separates MoE parameters into dedicated optimizer groups.
-    use_residual                : Adds residual connections to MoE outputs.      : Prints DeepSpeed timing internals — handy for finding bottlenecks.
-    """
-    # Optimization
-    lr: float = 3e-4
-    weight_decay: float = 0.1
-    betas: Tuple[float, float] = (0.9, 0.95)
-    grad_clip: float = 1.0
-    num_train_steps: int = 15000
-    warmup_steps: int = 1200
-    optimizer_type: Literal["AdamW", "PagedAdamW", "8bitAdamW"] = "8bitAdamW"
-    
-    # Batch / Throughput
-    micro_batch_size: int = 64
-    grad_accum_steps: int = 8
-    max_seq_len: int = 512
-    
-    # Precision / Performance
-    mixed_precision: Literal["no", "fp16", "bf16"] = "fp16"
-    
-    # Memory
-    activation_checkpointing: bool = True
-    compile_model: bool = False ### WARNING: torch.compile is currently experimental. Proceed with caution, as it may cause unexpected crashes or instability.                  
-    compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
-    
-    # MoE Stability
-    router_aux_loss_coef: float = 0.01
-    router_z_loss_coef: float = 5e-4
-    capacity_factor: float = 1.2
-    top_k: int = 2
-    
-    # Logging
-    save_interval: int = 500
-    num_eval_steps: int = 50
-    eval_interval: int = 1000
-    log_interval: int = 5
-    out_dir: str = "/kaggle/working/checkpoints"
-    
-    # DeepSpeed
-    deepspeed_enabled: bool = True
-    wall_clock_breakdown: bool = False
-    zero_stage: int = 2
-    overlap_comm: bool = True
-    contiguous_gradients: bool = True
-    reduce_bucket_size: int = 100_000_000
-    allgather_bucket_size: int = 100_000_000
-    allgather_partitions: bool = True
-    reduce_scatter: bool = True
-    offload_optimizer: bool = False
-    offload_param: bool = False
-    partition_activations: bool = False
-    cpu_checkpointing: bool = False
-    contiguous_memory_optimization: bool = True
-    num_checkpoints: int = 8
-    loss_scale_window: int = 1000
-    moe_enabled: bool = True
-    ep_size: int = 2
-    moe_param_group: bool = True
-    use_residual: bool = True
-    
-# Helper Functions 
-
-def build_deepspeed_config(cfg: TrainConfig) -> Dict[str, Any]:
-
-
-    zero_config: Dict[str, Any] = {
-        "stage": cfg.zero_stage,
-        "overlap_comm": cfg.overlap_comm,
-        "contiguous_gradients": cfg.contiguous_gradients,
-        "reduce_bucket_size": cfg.reduce_bucket_size,
-    }
-
-
-    if cfg.zero_stage == 1:
-        zero_config.update({
-            "reduce_scatter": True,
-        })
-
-    elif cfg.zero_stage == 2:
-        zero_config.update({
-            "allgather_partitions": True,
-            "allgather_bucket_size": cfg.reduce_bucket_size,
-        })
-
-    elif cfg.zero_stage == 3:
-        zero_config.update({
-            "stage3_prefetch_bucket_size": cfg.reduce_bucket_size // 2,
-            "stage3_param_persistence_threshold": 1_000_000,
-        })
-
-        if cfg.offload_param:
-            zero_config["offload_param"] = {"device": "cpu", "pin_memory": True}
-
-
-    if cfg.zero_stage >= 2 and cfg.offload_optimizer:
-        zero_config["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
-
-    ds_config: Dict[str, Any] = {
-        "train_micro_batch_size_per_gpu": cfg.micro_batch_size,
-        "gradient_accumulation_steps": cfg.grad_accum_steps,
-        "gradient_clipping": cfg.grad_clip,
-        "wall_clock_breakdown": cfg.wall_clock_breakdown,
-        "zero_optimization": zero_config,
-        "activation_checkpointing": {
-            "partition_activations": cfg.partition_activations,
-            "cpu_checkpointing": cfg.cpu_checkpointing,
-            "contiguous_memory_optimization": cfg.contiguous_memory_optimization,
-            "number_checkpoints": cfg.num_checkpoints,
-        },
-    }
-
-    if cfg.moe_enabled:
-        ds_config["moe"] = {
-            "enabled": True,
-            "ep_size": cfg.ep_size,
-            "moe_param_group": cfg.moe_param_group,
-            "use_residual": cfg.use_residual,
-        }
-
-    if cfg.mixed_precision == "fp16":
-        ds_config["fp16"] = {
-            "enabled": True,
-            "loss_scale": 0,
-            "loss_scale_window": cfg.loss_scale_window,
-            "initial_scale_power": 16,
-            "hysteresis": 2,
-            "min_loss_scale": 1,
-        }
-    elif cfg.mixed_precision == "bf16":
-        ds_config["bf16"] = {"enabled": True}
-    else:
-        ds_config["fp16"] = {"enabled": False}
-        ds_config["bf16"] = {"enabled": False}
-
-    return ds_config
-
-def has_checkpoint(path):
-    return (
-        os.path.exists(os.path.join(path, "model.safetensors")) or
-        os.path.exists(os.path.join(path, "pytorch_model.bin"))
-    )
-
-def prepare_checkpoint_from_dataset(cfg: TrainConfig):
-    """
-    Finds and copies the latest model checkpoint from a read-only dataset to the local working directory.
-
-    Args:
-        cfg (TrainConfig): Configuration object containing 'out_dir'.
-
-    Returns:
-        str or None: The local path to the copied checkpoint, or None if no checkpoint exists.
-    """
-
-    SRC_BASE = "/kaggle/input/datasets/abdelrhmanebied/model-checkpoint/checkpoints/regular"
-    DST_BASE = os.path.join(cfg.out_dir, "regular")
-    os.makedirs(DST_BASE, exist_ok=True)
-
-    if not os.path.exists(SRC_BASE):
-        print("No dataset checkpoint found, starting fresh.")
-        return None
-
-    subdirs = [d for d in os.listdir(SRC_BASE) if d.startswith("step_")]
-    if not subdirs:
-        print("No checkpoints inside dataset.")
-        return None
-
-    latest = max(subdirs, key=lambda x: int(x.split("_")[-1]))
-
-    SRC_PATH = os.path.join(SRC_BASE, latest)
-    DST_PATH = os.path.join(DST_BASE, latest)
-
-    if not os.path.exists(DST_PATH):
-        print(f"Copying {latest} → working dir...")
-        shutil.copytree(SRC_PATH, DST_PATH, dirs_exist_ok=True)
-    else:
-        print(f"{latest} already exists in working dir")
-
-    print(f"Checkpoint ready at: {DST_PATH}")
-    return DST_PATH
-
-def get_lr(step, cfg: TrainConfig):
-    """
-    Calculates the learning rate for a specific training step.
-
-    Args:
-        step (int): The current training step/iteration.
-        cfg (TrainConfig): Configuration object containing 'lr', 'warmup_steps', 
-                          and 'num_train_steps'.
-
-    Returns:
-        float: The calculated learning rate for the given step.
-    """
-
-    if step < cfg.warmup_steps:
-        return cfg.lr * step / cfg.warmup_steps
-    progress = (step - cfg.warmup_steps) / (cfg.num_train_steps - cfg.warmup_steps)
-    return 0.5 * cfg.lr * (1 + math.cos(math.pi * progress))
-
-
-def compute_loss(outputs, targets, cfg: TrainConfig):
-    """
-    Computes the cross-entropy loss with MoE stabilization penalties.
-
-    Args:
-        outputs (dict): Model output dictionary containing 'logits' [B, T, V], 
-                        and optional 'aux_loss' and 'z_loss' tensors.
-        targets (torch.Tensor): Ground truth token IDs of shape [B, T].
-        cfg (TrainConfig): Config object with 'router_aux_loss_coef' and 
-                          'router_z_loss_coef' scaling factors.
-
-    Returns:
-        torch.Tensor: The total combined scalar loss.
-    """
-    logits = outputs["logits"]
-    aux_loss = outputs.get("aux_loss", 0.0)
-    z_loss = outputs.get("z_loss", 0.0)
-    
-    shift_targets = targets[:, 1:]
-
-    loss = F.cross_entropy(
-        logits[:, :-1, :].reshape(-1, logits.size(-1)),
-        shift_targets.reshape(-1),
-        ignore_index=-100
-    )
-
-    loss = loss + cfg.router_aux_loss_coef * aux_loss \
-                 + cfg.router_z_loss_coef * z_loss
-
-    return loss
-
-
-
-def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
-    """
-    Evaluates the model on a validation set to compute loss and perplexity.
-
-    Args:
-        model (nn.Module): The model to evaluate.
-        val_dataloader (DataLoader): Iterator providing validation batches.
-        cfg (TrainConfig): Configuration for evaluation steps and loss coefficients.
-        accelerator (Accelerator): HF Accelerator for distributed reduction and device management.
-
-    Returns:
-        tuple (float, float): A tuple containing the global average (validation loss, perplexity).
-    """
-
-    model.eval()
-    model = accelerator.unwrap_model(model)
-    data_iter = iter(val_dataloader)
-    
-    device = accelerator.device
-    local_loss_sum = torch.tensor(0.0, device=device)
-    local_count = torch.tensor(0.0, device=device)
-    
-    with torch.inference_mode():
-   
-        for step, batch in enumerate(data_iter):
-            if step >= cfg.num_eval_steps:
-                break
-
-    
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            labels = batch.get("labels", input_ids).to(device, non_blocking=True)
-
-     
-            if "position_ids" in batch:
-                position_ids = batch["position_ids"].to(device, non_blocking=True)
-            else:
- 
-                batch_size, seq_len = input_ids.shape
-                position_ids = torch.arange(seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size, -1)\
-                
-            outputs = model(input_ids, position_ids=position_ids)
-            loss = compute_loss(outputs, labels, cfg)
-            
-            batch_size = input_ids.size(0)
-            local_loss_sum += loss.detach() * batch_size
-            local_count += batch_size
-
-    global_loss_sum = accelerator.reduce(local_loss_sum, reduction="sum")
-    global_count = accelerator.reduce(local_count, reduction="sum")
-
-    val_loss = (global_loss_sum / global_count).item()
-    val_ppl = math.exp(min(val_loss, 20))
-
-    model.train()
-    return val_loss, val_ppl
-    
-def build_accelerator(cfg: TrainConfig) -> Accelerator:
-    ds_plugin = None
-
-    if cfg.deepspeed_enabled:
-        ds_plugin = DeepSpeedPlugin(hf_ds_config=build_deepspeed_config(cfg))
-
-    accelerator = Accelerator(
-        mixed_precision=cfg.mixed_precision,
-        gradient_accumulation_steps=cfg.grad_accum_steps,
-        log_with="wandb",
-        deepspeed_plugin=ds_plugin,
-    )
-    return accelerator
-
-# TRAINING LOOP
 
 def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: TrainConfig):
     """
@@ -461,14 +47,11 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
     """
 
     accelerator = build_accelerator(cfg)
-
     device = accelerator.device
-    if accelerator.is_main_process:
-     wandb.login(key=wandb_key)
-        
+    
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="Tiny-MoE-300M",
+            project_name="Tiny-MoE-200M",
             config=vars(cfg)
         )
         
@@ -492,7 +75,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         fused=True
         )
         accelerator.print('Using AdamW')
-    elif cfg.optimizer_type== "Paged":
+    elif cfg.optimizer_type == "Paged":
         optimizer =bnb.optim.PagedAdamW8bit(
         model.parameters(),
         lr=cfg.lr,
@@ -500,7 +83,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         weight_decay=cfg.weight_decay
         )
         accelerator.print('Using PagedAdamW')
-    else:
+    elif cfg.optimizer_type == "8bitAdamW":
         optimizer =bnb.optim.AdamW8bit(
         model.parameters(),
         lr=cfg.lr,
@@ -517,7 +100,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
 
     
     prepare_checkpoint_from_dataset(cfg)
-        
+    accelerator.wait_for_everyone()     
     best_loss=float("inf")
     best_step=0
     tokens_seen=0
@@ -567,7 +150,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
             best_loss = meta.get("best_loss", meta.get("loss", float("inf")))
     
             accelerator.print(
-                f"Resumed at step {step} | best_loss {best_loss:.4f}"
+                f"Resumed at step {step} | best_loss {best_loss:.4f} | best_step {best_step} | tokens_seen {tokens_seen}"
             )
     else:
         accelerator.print("No checkpoint found — starting from scratch.")
@@ -593,15 +176,8 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         with accelerator.accumulate(model):
             local_tokens = batch["input_ids"].numel()
             input_ids = batch["input_ids"].to(device,non_blocking=True)
-            
             labels = batch.get("labels", input_ids).to(device,non_blocking=True)
-
-            curr_bsz, curr_seq_len = input_ids.shape 
-
-
-            pos_base = torch.arange(curr_seq_len, device=device)
-
-            position_ids = pos_base.unsqueeze(0).expand(curr_bsz, -1) 
+            position_ids = batch["position_ids"].to(device, non_blocking=True)
             
             if cfg.compile_mode in ["reduce-overhead", "max-autotune"]:
                 torch.compiler.cudagraph_mark_step_begin()
@@ -670,32 +246,29 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                             "tokens_seen": tokens_seen, 
                         }, os.path.join(save_path, "metadata.pt"))
                         
-
                         clean_state_dict = {}
                         pointer_map = {}
                         
                         for key, tensor in state_dict.items():
-
                             clean_key = key.replace("_orig_mod.", "").replace("module.", "")
                             
                             if not tensor.is_contiguous():
                                 tensor = tensor.contiguous()
-                                
+                                    
                             ptr = tensor.data_ptr()
                             
                             if ptr in pointer_map:
-
                                 clean_state_dict[clean_key] = tensor.clone()
                                 accelerator.print(f"Untying Cloned shared storage for key: {clean_key}")
                             else:
                                 pointer_map[ptr] = clean_key
                                 clean_state_dict[clean_key] = tensor
-                        
-
+                            
                         save_file(clean_state_dict, os.path.join(save_path, "model.safetensors"))
                         accelerator.print(f"checkpoint successfully saved at {save_path}")
                         
                     accelerator.wait_for_everyone()
+
                 
                         
                 
@@ -738,41 +311,10 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
                         raw_z = outputs["z_loss"].detach()
                         log_data["z_loss"] = accelerator.gather(raw_z).mean().item()
                     
-                    if "router_logits" in outputs and outputs["router_logits"] is not None:
-                        logits = accelerator.gather(outputs["router_logits"]).detach()
-                        
-                        real_model = model.module if hasattr(model, "module") else model
-                        
-                        num_experts = real_model.config.num_experts
-                        top_k = real_model.config.num_experts_per_token
-                        topk_indices = torch.topk(
-                            logits, top_k, dim=-1
-                        ).indices
-                
-                        chosen_experts = topk_indices.reshape(-1)
-
-
-                        counts = torch.bincount(
-                            chosen_experts, minlength=num_experts
-                        ).float()
-                
-                        load = counts / (counts.sum() + 1e-9)
-                        
-                
-                        log_data["router/load_std"] = load.std().item()
-                        log_data["router/load_max"] = load.max().item()
-                        log_data["router/load_min"] = load.min().item()
-                        log_data["router/load_ratio"] = (load.max() / (load.min() + 1e-9)).item()
-                
-
-                        entropy = -(load * (load + 1e-9).log()).sum()
-                        log_data["router/entropy"] = entropy.item()
-                        utilization=torch.exp(entropy)/num_experts
-                        log_data["router/utilization"] = utilization.item()
-                        probs = torch.softmax(logits, dim=-1)
-                        confidence = probs.max(dim=-1).values.mean()
-                        log_data["router/confidence"] = confidence.item()
-                        
+                    if "router_metrics" in outputs and outputs["router_metrics"] is not None:
+                        for metric_name, metric_tensor in outputs["router_metrics"].items():
+                            gathered_metric = accelerator.gather(metric_tensor)
+                            log_data[metric_name] = gathered_metric.mean().item()
                     if accelerator.is_main_process:
                      accelerator.log(log_data, step=step)
 
@@ -794,12 +336,14 @@ if __name__ == "__main__":
     config = ModelConfig()
     model = Transformer(config)
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token == tokenizer.eos_token
     train_dataset = Training_Streaming_Dataset(config, tokenizer,seed = 800813,shuffle_buffer_size = 50_000)
     train_dataloader = DataLoader(train_dataset, 
                             batch_size=cfg.micro_batch_size,
                             drop_last=True,
-                            num_workers=1,
-                            prefetch_factor=1,
+                            num_workers=2,
+                            prefetch_factor=2,
                             persistent_workers=True,
                             pin_memory=True)
     val_dataset = Eval_Streaming_Dataset(config, 

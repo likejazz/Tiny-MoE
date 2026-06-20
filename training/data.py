@@ -1,21 +1,8 @@
-from kaggle_secrets import UserSecretsClient
-
-user_secrets = UserSecretsClient()
-hf_token = user_secrets.get_secret("HF_TOKEN") 
-
-from huggingface_hub import login
-login(token=hf_token)
-from transformers import AutoTokenizer
 from datasets import load_dataset, interleave_datasets
 from torch.utils.data import IterableDataset, get_worker_info
 import torch
 import torch.distributed as dist
 
-
-
-
-tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-tokenizer.pad_token = tokenizer.eos_token
 
 class Training_Streaming_Dataset(IterableDataset):
     """
@@ -78,16 +65,11 @@ class Training_Streaming_Dataset(IterableDataset):
             streaming=True,
         )
 
-        ds_wiki = load_dataset(
-            "wikimedia/wikipedia",
-            "20231101.en",
-            split="train",
-            streaming=True,
-        )
+
 
         mixed = interleave_datasets(
-            [ds_web, ds_cosmopedia_web, ds_math, ds_wiki],
-            probabilities=[0.57, 0.23, 0.14, 0.06],
+            [ds_web, ds_cosmopedia_web, ds_math],
+            probabilities=[0.60, 0.25, 0.15],
             stopping_strategy="all_exhausted",
             seed=seed,
         )

@@ -1,97 +1,15 @@
-# IMPORTS
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import Optional,Literal
+from typing import Optional
 from torch.utils.checkpoint import checkpoint
 import math
+from TrainingConfigs import ModelConfig
 try:
     from flash_attn import flash_attn_func
     FLASH_AVAILABLE = True
 except ImportError:
     FLASH_AVAILABLE = False
-
-
-
-
-@dataclass
-class ModelConfig:
-    """
-    Model architecture configuration for a MoE language model with MLA attention.
-    
-    Core
-    ----
-    vocab_size              : Number of tokens in the vocabulary.
-    hidden_size             : Embedding and hidden state dimension across all layers.
-    num_layers              : Number of transformer decoder layers.
-    initializer_range       : Std dev for weight initialization.
-    tie_word_embeddings     : Shares weights between input embeddings and output projection.
-    max_seq_len             : Maximum sequence length the model can process.
-    max_batch_size          : Maximum batch size for static KV-cache allocation.
-    
-    RMSNorm
-    -------
-    rms_norm_eps            : Small epsilon added for numerical stability in RMSNorm.
-    
-    RoPE & YaRN
-    -----------
-    rope_theta              : Base frequency controlling how fast RoPE rotations decay.
-    rope_type               : Positional encoding variant — "yarn" enables context extension.
-    beta_slow               : YaRN low-frequency interpolation boundary.
-    beta_fast               : YaRN high-frequency interpolation boundary.
-    factor                  : YaRN scale factor for extending beyond the training context.
-    mscale                  : YaRN magnitude scaling; inferred automatically if None.
-    original_max_seq_len    : The sequence length the model was originally trained on.
-    
-    MLA (Multi-head Latent Attention)
-    ----------------------------------
-    num_attention_heads     : Number of query heads.
-    kv_lora_rank            : Rank of the low-rank KV compression — smaller means less KV cache memory.
-    qk_nope_dim             : Per-head dimension for the non-positional (NoPE) query/key path.
-    qk_rope_dim             : Per-head dimension for the rotary-encoded query/key path.
-    attn_impl               : Attention backend — "flash_attn" is faster and more memory efficient.
-    
-    MoE (Mixture of Experts)
-    ------------------------
-    num_experts             : Total number of experts in each MoE FFN layer.
-    num_experts_per_token   : How many experts each token is routed to.
-    moe_intermediate_size   : Hidden dimension inside each expert's FFN.
-    """
-    vocab_size: int = 32000
-    hidden_size: int = 768
-    num_layers: int = 16
-    initializer_range: float = 0.02
-    tie_word_embeddings: bool = True
-    max_seq_len: int = 512
-    max_batch_size: int = 1
-    
-    # RMSNorm
-    rms_norm_eps: float = 1e-6
-    
-    # RoPE & YaRN 
-    rope_theta: float = 10000.0
-    rope_type: str = "default"
-    beta_slow: float = 1.0
-    beta_fast: float = 32.0
-    factor: float = 1.0
-    mscale: Optional[float] = None
-    original_max_seq_len: int = 512
-
-    # MLA
-    num_attention_heads: int = 8
-    kv_lora_rank: int = 128
-    qk_nope_dim: int = 64
-    qk_rope_dim: int = 32
-    attn_impl: Literal["sdpa", "flash_attn"] = "sdpa"
-
-    # MoE
-    num_experts: int = 8
-    num_experts_per_token: int = 2
-    moe_intermediate_size: int = 1024
-
-
 
 
 
@@ -134,7 +52,7 @@ class RoPE(nn.Module):
         super().__init__()
 
         self.dim = config.qk_rope_dim
-        self.max_seq_len = getattr(config, "max_seq_len", 1024)
+        self.max_seq_len = config.max_seq_len
         self.theta = getattr(config, "rope_theta", 10000.0)
 
         self.rope_type = getattr(config, "rope_type", "default") 
@@ -148,7 +66,7 @@ class RoPE(nn.Module):
         self.beta_fast = float(getattr(config, "beta_fast", 32.0))
 
 
-        self.attention_factor = getattr(config, "mscale", None)
+        self.attention_factor = 0.1 * math.log(self.factor) + 1.0
 
         if self.dim % 2 != 0:
             raise ValueError("qk_rope_dim must be even")
@@ -268,10 +186,10 @@ class MLA(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_dim = config.qk_nope_dim
         self.qk_rope_dim = config.qk_rope_dim
-        self.attention_factor = config.mscale
         self.max_seq_len = config.max_seq_len
         self.original_max_seq_len = config.original_max_seq_len
         self.factor=config.factor
+        self.attention_factor = 0.1 * math.log(self.factor) + 1
         self.attn_impl=config.attn_impl
         self.flash_available = FLASH_AVAILABLE
 
@@ -311,66 +229,66 @@ class MLA(nn.Module):
 
 
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
+        # Batch_Size = B
+        # Seq_len = T
+        # kv_lora_rank = Dc
+        # qk_nope_dim = Dn
+        # qk_rope_dim = Dr
+        # head_dim = Dv
+        # num_heads = H
         bsz, seq_len, _ = x.shape
 
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(bsz, -1)
 
-        c_in = self.w_in(x)
-        c_kv, c_q = c_in.split(self.kv_lora_rank, dim=-1)
+        c_in = self.w_in(x) # [B,T,D] @ [D,2*Dc] -> [B,T,2*Dc]
+        c_kv, c_q = c_in.split(self.kv_lora_rank, dim=-1)  #c_kv [B,T,Dc] c_q  [B,T,Dc]
 
-
+        #[B,T,Dc] @ [D,H*(Dn+Dr)] - > [B,T,H(Dn+Dr)]
         q_proj = self.w_uq_qr(c_q).reshape(
             bsz, seq_len, self.num_heads, self.qk_nope_dim + self.qk_rope_dim
-        )
-        q_nope, q_rope = q_proj.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1)
-        q_rope = self.rope(q_rope, position_ids)
+        ) # [B,T,H,Dn+Dr]
+        q_nope, q_rope = q_proj.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1) #[B,T,H,Dn]
+        q_rope = self.rope(q_rope, position_ids) # [B,T,H,Dr]
 
 
-        q_lat = torch.einsum("bthd,hdr->bthr", q_nope, self.w_uk)
+        q_nope = q_nope.transpose(1, 2)  #[B,H,T,Dn]
+        q_rope = q_rope.transpose(1, 2)  #[B,H,T,Dr]
+
+        # [B,T,Dc] -> Unsqueeze - > [B,1,T,Dc]
+        # [H,Dr,Dc] - > Transpose - > [H,Dc,Dr]
+        # [B,1,T,Dc] @ [H,Dc,Dr] - > [B,H,T,Dr]
+        k_nope = c_kv.unsqueeze(1) @ self.w_uk.transpose(-1, -2)
+        # [B,T,D] @ [D,Dr] - >[B,T,Dr] -> unsqueeze -> [B,T,1,Dr] - > squeeze - > [B,T,Dr]
+        k_rope = self.rope(self.w_kr(x).unsqueeze(2), position_ids).squeeze(2)  
+        k_rope = k_rope.unsqueeze(1).expand(-1, self.num_heads, -1, -1)  #[B,1,T,Dr] - > [B,H,T,Dr]       
+
+        #[B,T,Dc] - > Unsqueeze -> [B,1,T,Dc] @ [H,Dc,Dv] - > [B,H,T,Dv]
+        v = c_kv.unsqueeze(1) @ self.w_uv
 
 
-        k_rope = self.w_kr(x).unsqueeze(2)  
-        k_rope = self.rope(k_rope, position_ids)
-        k_rope = k_rope.expand(-1, -1, self.num_heads, -1)
-
-        k_lat = c_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
-        
-
-        q = torch.cat([q_lat, q_rope], dim=-1)
-        k = torch.cat([k_lat, k_rope], dim=-1)
-        v = c_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+        q = torch.cat([q_nope, q_rope], dim=-1)  #[B,H,T,Dn] + [B,H,T,Dr] - > [B,H,T,Dn+Dr]
+        k = torch.cat([k_nope, k_rope], dim=-1)  # [B,H,T,Dn+Dr]
+ 
         
         if self.attn_impl == "sdpa":
-
-            q_ = q.transpose(1, 2)
-            k_ = k.transpose(1, 2)
-            v_ = v.transpose(1, 2)
-        
-            attn_lat = F.scaled_dot_product_attention(
-                q_,
-                k_,
-                v_,
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
                 is_causal=True,
                 scale=self.softmax_scale,
-            )  
-        
-        elif self.attn_impl == "flash_attn" and self.FLASH_AVAILABLE:
-            
-            attn_lat = flash_attn_func(
-                q,
-                k,
-                v,
+            )  # [B,H,T,Dv]
+
+        elif self.attn_impl == "flash_attn" and self.flash_available:
+            attn_out = flash_attn_func(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
                 causal=True,
                 softmax_scale=self.softmax_scale,
-            )  
-            attn_lat = attn_lat.transpose(1, 2)  
-        
-        attn_out = torch.einsum("bhtk,hkd->bhtd", attn_lat, self.w_uv)
-        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-        
-        return self.w_o(attn_out)
+            ).transpose(1, 2)  #[B,T,H,Dv] - > transpose - > [B,H,T,Dv]
 
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)  # [B,T,H*Dv]
+        return self.w_o(attn_out) # [B,T,H*Dv] @ [H*Dv,D] - > [B,T,D]
 
 
 class MoE(nn.Module):
@@ -398,21 +316,23 @@ class MoE(nn.Module):
         self.num_experts_per_token = config.num_experts_per_token
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
+        self.capacity_factor = config.capacity_factor
 
         self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
 
 
         self.w13 = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_size, self.hidden_size)
+            torch.empty(self.num_experts,self.hidden_size,2 * self.intermediate_size)
         )
         self.w2 = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
+            torch.empty(self.num_experts,self.intermediate_size, self.hidden_size,)
         )
         self.shared_w13 = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.shared_w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.reset_parameters()
 
     def reset_parameters(self):
+        
         nn.init.xavier_uniform_(self.router.weight)
         nn.init.xavier_uniform_(self.w13)
         nn.init.xavier_uniform_(self.w2)
@@ -427,58 +347,98 @@ class MoE(nn.Module):
         K = self.num_experts_per_token
         I = self.intermediate_size
 
-        gate_up_shared = self.shared_w13(x_flat)
-        gate_s, up_s = gate_up_shared.chunk(2, dim=-1)
-        shared_out = self.shared_w2(F.silu(gate_s) * up_s)
+        gate_up_shared = self.shared_w13(x_flat) #[N,D] @ [D,2I] - > [N,2I] 
+        gate_s, up_s = gate_up_shared.chunk(2, dim=-1) # gate_S [N,I] up_s [N,I]
+        shared_out = self.shared_w2(F.silu(gate_s) * up_s) # [N,I] @ [N,I] - > [N,I] @ [I,D] - > [N,D]
         
-        router_logits = self.router(x_flat).to(torch.float32)   
-        router_probs = F.softmax(router_logits, dim=-1)         
-        importance = router_probs.mean(dim=0)                  
+        router_logits = self.router(x_flat).to(torch.float32)  # [N,D] @ [D,E] - > [N,E]
+
+        log_z = torch.logsumexp(router_logits, dim=-1)              # [N]  
+        router_probs = torch.exp(router_logits - log_z.unsqueeze(-1)) # [N,E] 
+        importance = router_probs.mean(dim=0)                         # [E]           
         
         topk_logits, topk_indices = torch.topk(
             router_logits, K, dim=-1, sorted=False
-        )                                                       
-        topk_weights = F.softmax(topk_logits, dim=-1)           
+        )         #[N,K]                                              
+        topk_weights = F.softmax(topk_logits, dim=-1)    # [N,K]       
         
-        expert_ids = topk_indices.reshape(-1)                   
-        token_ids = torch.arange(N, device=x.device).unsqueeze(1).expand(N, K).reshape(-1)
-        gates = topk_weights.reshape(-1).to(x_flat.dtype)       
+        expert_ids = topk_indices.reshape(-1) #[N*K]       
+        token_ids = torch.arange(N, device=x.device).unsqueeze(1).expand(N, K).reshape(-1) #[N*K]
+        gates = topk_weights.reshape(-1).to(x_flat.dtype) #[N*K]      
         
-        sort_perm = torch.argsort(expert_ids)
-        expert_ids = expert_ids[sort_perm]
+        expert_ids, sort_perm = torch.sort(expert_ids)  
         token_ids = token_ids[sort_perm]
         gates = gates[sort_perm]
         
-        counts = torch.bincount(expert_ids, minlength=E)        
-        expert_starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])  
-        starts = expert_starts[expert_ids]                      
+        counts = torch.bincount(expert_ids, minlength=E)   #[E]    
+        expert_starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])  #[E]
+        starts = expert_starts[expert_ids]  #[N*K]             
         
-        max_count = counts.max()
-        load = counts.float()
-        aux_loss = E * torch.dot(importance, load) / (N * K)
-        z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+
+        load = counts.float() / counts.sum().clamp_min(1.0) #[E]
+        aux_loss = E * torch.dot(importance, load) 
+        z_loss = torch.mean(log_z ** 2)
         
-        slot_ids = torch.arange(expert_ids.numel(), device=x.device) - starts
+
+        capacity = max(int((N * K / E) * self.capacity_factor),1)
         
-        packed_inputs = x_flat.new_zeros((E, max_count, hidden))
-        packed_inputs[expert_ids, slot_ids] = x_flat[token_ids]
+        slot_ids = torch.arange(expert_ids.numel(), device=x.device) - starts #[N*K]
         
-        proj = torch.matmul(packed_inputs, self.w13.transpose(1, 2))
-        gate, up = proj.chunk(2, dim=-1)
-        expert_hidden = F.silu(gate) * up
+
+        valid_mask = slot_ids < capacity #[N*K]
         
-        packed_outputs = torch.matmul(expert_hidden, self.w2.transpose(1, 2))
-        valid_outputs = packed_outputs[expert_ids, slot_ids]
+   
+        expert_ids = expert_ids[valid_mask]
+        slot_ids = slot_ids[valid_mask]
+        token_ids = token_ids[valid_mask]
+        gates = gates[valid_mask]
         
-        routed_out = x_flat.new_zeros((N, hidden))
+
+        drop_counts = torch.bincount(expert_ids, minlength=E).float()
+        load = drop_counts / (drop_counts.sum() + 1e-9)
+        
+
+        probs = torch.softmax(router_logits, dim=-1)
+        confidence = probs.max(dim=-1).values.mean()
+        
+  
+        entropy = -(load * (load + 1e-9).log()).sum()
+        utilization = torch.exp(entropy) / E
+        
+
+        router_metrics = {
+            "load_std": load.std().detach().reshape(1),
+            "load_max": load.max().detach().reshape(1),
+            "load_min": load.min().detach().reshape(1),
+            "load_ratio": (load.max() / (load.min() + 1e-9)).detach().reshape(1),
+            "entropy": entropy.detach().reshape(1),
+            "utilization": utilization.detach().reshape(1),
+            "confidence": confidence.detach().reshape(1),
+        }
+
+        packed_inputs = x_flat.new_zeros((E, capacity, hidden)) #[E,C,D]
+        packed_inputs[expert_ids, slot_ids] = x_flat[token_ids] #[E,C,D]
+        
+
+        proj = torch.matmul(packed_inputs, self.w13) # [E,C,D] @ [E,D,2I] -> [E,C,2I]
+        gate, up = proj.chunk(2, dim=-1) #[E,C,I]
+        expert_hidden = F.silu(gate) * up #[E,C,I]
+        
+        packed_outputs = torch.matmul(expert_hidden, self.w2) #[E,C,I] @ [E,I,D] -> [E,C,D]
+        valid_outputs = packed_outputs[expert_ids, slot_ids] #[M,D] (M is number of valid tokens)
+        
+
+        routed_out = x_flat.new_zeros((N, hidden)) #[N,D]
         routed_out.index_add_(
             0,
             token_ids,
             valid_outputs * gates.unsqueeze(-1)
-        )
+        ) #[N,D]
         
+        # [N,D] + [N,D] -> [N,D] -> view -> [B,T,D]
         output = (shared_out + routed_out).view(bsz, seq_len, hidden)
-        return output, aux_loss, z_loss, router_logits
+        return output, aux_loss, z_loss, router_metrics
+
 
 class TransformerBlock(nn.Module):
     """
@@ -507,9 +467,9 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         h = x + self.ls1 * self.attn(self.attn_norm(x), position_ids)
-        moe_out, aux_loss, z_loss, router_logits = self.moe(self.ffn_norm(h))
+        moe_out, aux_loss, z_loss, router_metrics = self.moe(self.ffn_norm(h))
         x = h + self.ls2 * moe_out
-        return x, aux_loss, z_loss, router_logits
+        return x, aux_loss, z_loss, router_metrics
 
 class Transformer(nn.Module):
     """
@@ -563,29 +523,36 @@ class Transformer(nn.Module):
     def forward(self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         x = self.embed_tokens(input_ids)
 
-     
-        
         total_aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         total_z_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        last_router_logits = None
+        all_layer_metrics = []
+        
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x, aux_loss, z_loss,router_logits = checkpoint(layer, x, position_ids, use_reentrant=False)
+                x, aux_loss, z_loss, router_metrics = checkpoint(layer, x, position_ids, use_reentrant=False)
             else:
-                x, aux_loss, z_loss,router_logits = layer(x, position_ids)
+                x, aux_loss, z_loss, router_metrics = layer(x, position_ids)
+                
+            if router_metrics is not None:
+                all_layer_metrics.append(router_metrics)
 
-            
-            last_router_logits = router_logits
             total_aux_loss += aux_loss
             total_z_loss += z_loss
 
-        x=self.norm(x)
+        x = self.norm(x)
+        logits = self.lm_head(x)
         
-        logits=self.lm_head(x)
+        avg_router_metrics = {}
+        if len(all_layer_metrics) > 0:
+            for key in all_layer_metrics[0].keys():
+                avg_router_metrics[f"router/{key}"] = torch.stack(
+                    [m[key] for m in all_layer_metrics]
+                ).mean()
         
+
         return {
             "logits": logits,
             "aux_loss": total_aux_loss,
             "z_loss": total_z_loss,
-            "router_logits": last_router_logits
+            "router_metrics": avg_router_metrics
         }

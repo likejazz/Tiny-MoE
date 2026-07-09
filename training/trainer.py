@@ -7,12 +7,12 @@ from torch.utils.data import DataLoader
 from accelerate import Accelerator,DeepSpeedPlugin
 from tqdm import tqdm
 import bitsandbytes as bnb
-from model import Transformer
-from data import Training_Streaming_Dataset,Eval_Streaming_Dataset
+from training.model_train import Transformer
+from training.data import Training_Streaming_Dataset,Eval_Streaming_Dataset
 from transformers import AutoTokenizer
 from safetensors.torch import save_file
-from helpers import build_deepspeed_config,has_checkpoint,prepare_checkpoint_from_dataset,get_lr,compute_loss,evaluate,build_accelerator
-from TrainingConfigs import TrainConfig,ModelConfig
+from training.helpers import build_deepspeed_config,has_checkpoint,prepare_checkpoint_from_dataset,get_lr,compute_loss,evaluate,build_accelerator
+from training.training_configs import TrainConfig,ModelConfig
 
 
 
@@ -39,11 +39,6 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
         - Saves model weights and optimizer states to `cfg.out_dir`.
         - Prints training progress to the console via the main process accelerator.
         - Enables gradient checkpointing and torch compilation on the model if configured.
-
-    Note:
-        The function specifically calculates MoE metrics if the model outputs 
-        `router_logits`, including expert load balancing, entropy, and utilization 
-        to monitor for expert collapse.
     """
 
     accelerator = build_accelerator(cfg)
@@ -104,10 +99,8 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
     best_loss=float("inf")
     best_step=0
     tokens_seen=0
-
     step = 0
-    checkpoint_dir = os.path.join(cfg.out_dir, "best")
-    os.makedirs(checkpoint_dir, exist_ok=True)
+
     
     
     regular_ckpt_dir = os.path.join(cfg.out_dir, "regular")
@@ -116,12 +109,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
 
     resume_path = None
     
-
-    if has_checkpoint(checkpoint_dir):
-        resume_path = checkpoint_dir
-    
-
-    elif os.path.exists(regular_ckpt_dir):
+    if os.path.exists(regular_ckpt_dir):
         subdirs = [
             os.path.join(regular_ckpt_dir, d)
             for d in os.listdir(regular_ckpt_dir)

@@ -4,12 +4,19 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator,DeepSpeedPlugin
 from typing import Dict,Any
-from TrainingConfigs import TrainConfig
+from training.training_configs import TrainConfig
 from torch.utils.data import DataLoader
 import shutil
 def build_deepspeed_config(cfg: TrainConfig) -> Dict[str, Any]:
+    """
+    Build a DeepSpeed configuration from a training configuration.
 
+    Args:
+        cfg: Training configuration.
 
+    Returns:
+        A DeepSpeed configuration dictionary.
+    """
     zero_config: Dict[str, Any] = {
         "stage": cfg.zero_stage,
         "overlap_comm": cfg.overlap_comm,
@@ -82,6 +89,15 @@ def build_deepspeed_config(cfg: TrainConfig) -> Dict[str, Any]:
     return ds_config
 
 def has_checkpoint(path):
+    """
+    Check whether a model checkpoint exists in a directory.
+
+    Args:
+        path: Directory to check.
+
+    Returns:
+        True if a supported checkpoint file exists, otherwise False.
+    """
     return (
         os.path.exists(os.path.join(path, "model.safetensors")) or
         os.path.exists(os.path.join(path, "pytorch_model.bin"))
@@ -169,8 +185,8 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
         ignore_index=-100,
     )
 
-    loss = loss + cfg.router_aux_loss_coef * aux_loss \
-                 + cfg.router_z_loss_coef * z_loss
+    loss = loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss)
+
 
     return loss
 
@@ -214,7 +230,7 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
             else:
  
                 batch_size, seq_len = input_ids.shape
-                position_ids = torch.arange(seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size, -1)\
+                position_ids = torch.arange(seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size, -1)
                 
             outputs = model(input_ids, position_ids=position_ids)
             loss = compute_loss(outputs, labels, cfg)
@@ -233,6 +249,15 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
     return val_loss, val_ppl
     
 def build_accelerator(cfg: TrainConfig) -> Accelerator:
+    """
+    Build and configure an Accelerate accelerator.
+
+    Args:
+        cfg: Training configuration.
+
+    Returns:
+        A configured Accelerator instance.
+    """
     ds_plugin = None
 
     if cfg.deepspeed_enabled:

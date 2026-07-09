@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Optional
 from torch.utils.checkpoint import checkpoint
 import math
-from TrainingConfigs import ModelConfig
+from training.training_configs import ModelConfig
 try:
     from flash_attn import flash_attn_func
     FLASH_AVAILABLE = True
@@ -53,9 +53,9 @@ class RoPE(nn.Module):
 
         self.dim = config.qk_rope_dim
         self.max_seq_len = config.max_seq_len
-        self.theta = getattr(config, "rope_theta", 10000.0)
+        self.theta = config.rope_theta
 
-        self.rope_type = getattr(config, "rope_type", "default") 
+        self.rope_type = config.rope_type
 
   
         self.factor = float(getattr(config, "factor", 1.0))
@@ -66,7 +66,6 @@ class RoPE(nn.Module):
         self.beta_fast = float(getattr(config, "beta_fast", 32.0))
 
 
-        self.attention_factor = 0.1 * math.log(self.factor) + 1.0
 
         if self.dim % 2 != 0:
             raise ValueError("qk_rope_dim must be even")
@@ -164,21 +163,28 @@ class RoPE(nn.Module):
         return y
 class MLA(nn.Module):
     """
-    Implements Multi-Head Latent Attention (MLA) with Low-Rank Compression.
+    Multi-head Latent Attention (MLA) module.
 
-    This module reduces the KV cache footprint by projecting hidden states into a 
-    latent space before up-projecting into query, key, and value components. It 
-    uses a split-stream approach for Rotary Positional Embeddings (RoPE).
+    Implements DeepSeek-style MLA with RoPE, YaRN context extension,
+    FlashAttention support, and low-rank KV compression for efficient
+    attention.
 
     Args:
-        config (ModelConfig): Configuration object containing 'hidden_size', 
-                             'kv_lora_rank', 'qk_nope_dim', and 'qk_rope_dim'.
+        config: Model configuration containing MLA hyperparameters.
 
-    Returns:
-        torch.Tensor: The attention output tensor of shape [batch, seq_len, hidden_size].
+    Attributes:
+        hidden_size: Transformer hidden dimension.
+        num_heads: Number of attention heads.
+        kv_lora_rank: Rank of the compressed KV representation.
+        qk_nope_dim: Dimension of the non-positional query/key component.
+        qk_rope_dim: Dimension of the rotary query/key component.
+        max_seq_len: Maximum supported sequence length.
+        original_max_seq_len: Original training context length.
+        factor: YaRN context extension factor.
+        attention_factor: YaRN attention scaling factor.
+        attn_impl: Attention backend.
+        flash_available: Whether FlashAttention is available.
     """
-
-
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -308,7 +314,9 @@ class MoE(nn.Module):
             - output (torch.Tensor): Combined output from shared and routed experts.
             - aux_loss (torch.Tensor): Load balancing loss for the router.
             - z_loss (torch.Tensor): Stability loss to prevent logit explosion.
-            - router_logits (torch.Tensor): Raw logits from the expert selection.
+            - router_metrics (dict): Dictionary containing all router related metrics  such as
+            expert load, load ratio, load standard deviation, minimum/maximum
+            expert load, routing confidence, entropy, experts utilization.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -366,16 +374,16 @@ class MoE(nn.Module):
         token_ids = torch.arange(N, device=x.device).unsqueeze(1).expand(N, K).reshape(-1) #[N*K]
         gates = topk_weights.reshape(-1).to(x_flat.dtype) #[N*K]      
         
-        expert_ids, sort_perm = torch.sort(expert_ids)  
-        token_ids = token_ids[sort_perm]
-        gates = gates[sort_perm]
+        expert_ids, sort_perm = torch.sort(expert_ids)  #[N*K]
+        token_ids = token_ids[sort_perm] #[N*K]
+        gates = gates[sort_perm] #[N*K]
         
         counts = torch.bincount(expert_ids, minlength=E)   #[E]    
         expert_starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])  #[E]
         starts = expert_starts[expert_ids]  #[N*K]             
         
 
-        load = counts.float() / counts.sum().clamp_min(1.0) #[E]
+        load = counts.float() / (counts.sum() + 1e-9) #[E]
         aux_loss = E * torch.dot(importance, load) 
         z_loss = torch.mean(log_z ** 2)
         
@@ -388,18 +396,16 @@ class MoE(nn.Module):
         valid_mask = slot_ids < capacity #[N*K]
         
    
-        expert_ids = expert_ids[valid_mask]
-        slot_ids = slot_ids[valid_mask]
-        token_ids = token_ids[valid_mask]
-        gates = gates[valid_mask]
+        expert_ids = expert_ids[valid_mask]#[N*K]
+        slot_ids = slot_ids[valid_mask]#[N*K]
+        token_ids = token_ids[valid_mask]#[N*K]
+        gates = gates[valid_mask]#[N*K]
         
 
         drop_counts = torch.bincount(expert_ids, minlength=E).float()
         load = drop_counts / (drop_counts.sum() + 1e-9)
         
-
-        probs = torch.softmax(router_logits, dim=-1)
-        confidence = probs.max(dim=-1).values.mean()
+        confidence = router_probs.max(dim=-1).values.mean()
         
   
         entropy = -(load * (load + 1e-9).log()).sum()
@@ -422,9 +428,8 @@ class MoE(nn.Module):
 
         proj = torch.matmul(packed_inputs, self.w13) # [E,C,D] @ [E,D,2I] -> [E,C,2I]
         gate, up = proj.chunk(2, dim=-1) #[E,C,I]
-        expert_hidden = F.silu(gate) * up #[E,C,I]
-        
-        packed_outputs = torch.matmul(expert_hidden, self.w2) #[E,C,I] @ [E,I,D] -> [E,C,D]
+        packed_outputs = torch.matmul(F.silu(gate) * up, self.w2)  # [E,C,I] @ [E,I,D] -> [E,C,D]
+
         valid_outputs = packed_outputs[expert_ids, slot_ids] #[M,D] (M is number of valid tokens)
         
 
@@ -451,7 +456,7 @@ class TransformerBlock(nn.Module):
         x (torch.Tensor): Updated hidden states.
         aux_loss (torch.Tensor): Load balancing loss for the router.
         z_loss (torch.Tensor): Stability loss to prevent logit explosion.
-        router_logits (torch.Tensor): Raw logits from the expert selection.
+        router_metrics (dict): Dictionary containing all router related metrics 
     """
 
     def __init__(self, config: ModelConfig):
@@ -491,8 +496,7 @@ class Transformer(nn.Module):
               from all internal MoE layers.
             - 'z_loss' (torch.Tensor): Accumulated router stability loss summed 
               from all internal MoE layers.
-            - 'router_logits' (torch.Tensor): The raw router scores from the 
-              very last layer in the stack.
+            - 'router_metrics (dict):Dictionary containing all router related metrics 
     """
 
     def __init__(self, config: ModelConfig):

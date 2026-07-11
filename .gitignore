@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Training outputs
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Dataset/cache files
+data/
+datasets/
+.cache/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store

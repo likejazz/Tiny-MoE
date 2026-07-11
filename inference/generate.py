@@ -169,9 +169,9 @@ def main() -> None:
         top_k=None,
         repetition_penalty=1.2,
         no_repeat_ngram_size=3,
-        max_new_tokens=25,   
+        max_new_tokens=50,   
         do_sample=False,
-        model_variant="fine-tuned"
+        model_variant="base"
     )
     model = load_and_prepare_model(cfg,device)
     system_prompt = "You Are a helpful Ai Assistant."

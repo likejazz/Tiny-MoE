@@ -11,7 +11,7 @@ from training.model_train import Transformer
 from training.data import Training_Streaming_Dataset,Eval_Streaming_Dataset
 from transformers import AutoTokenizer
 from safetensors.torch import save_file
-from training.helpers import build_deepspeed_config,has_checkpoint,prepare_checkpoint_from_dataset,get_lr,compute_loss,evaluate,build_accelerator
+from training.helpers import build_deepspeed_config,has_checkpoint,prepare_checkpoint_from_dataset,get_lr,compute_loss,evaluate,build_accelerator,collate_fn
 from training.training_configs import TrainConfig,ModelConfig
 
 
@@ -24,7 +24,7 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
     This function handles the end-to-end training process including optimizer 
     initialization (supporting 8-bit variants), model compilation, gradient 
     accumulation, and periodic evaluation. It also features a robust resume 
-    mechanism that automatically detects the latest or best checkpoint.
+    mechanism that automatically detects the latest checkpoint.
 
     Args:
         model (torch.nn.Module): The transformer model to be trained.
@@ -320,28 +320,28 @@ def train(model,train_dataloader:DataLoader,val_dataloader:DataLoader,cfg: Train
     
     
 if __name__ == "__main__":
-    cfg = TrainConfig()
+    train_cfg = TrainConfig()
     config = ModelConfig()
     model = Transformer(config)
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
     if tokenizer.pad_token is None:
-        tokenizer.pad_token == tokenizer.eos_token
+        tokenizer.pad_token = tokenizer.eos_token
+    
     train_dataset = Training_Streaming_Dataset(config, tokenizer,seed = 800813,shuffle_buffer_size = 50_000)
+    val_dataset = Eval_Streaming_Dataset(config, tokenizer,eval_samples=5000)
+    
     train_dataloader = DataLoader(train_dataset, 
-                            batch_size=cfg.micro_batch_size,
-                            drop_last=True,
-                            num_workers=2,
-                            prefetch_factor=2,
-                            persistent_workers=True,
-                            pin_memory=True)
-    val_dataset = Eval_Streaming_Dataset(config, 
-                                         tokenizer,
-                                         eval_samples=5000)
-    val_dataloader = DataLoader(
-                        val_dataset,
-                        batch_size=cfg.micro_batch_size,
-                        drop_last=True,
-                        num_workers=0,
-                        pin_memory=True)
+                            batch_size=train_cfg.micro_batch_size,
+                            drop_last=train_cfg.drop_last,
+                            num_workers=train_cfg.num_workers,
+                            prefetch_factor=train_cfg.prefetch_factor,
+                            persistent_workers=train_cfg.persistent_workers,
+                            pin_memory=train_cfg.pin_memory)
+
+    val_dataloader = DataLoader(val_dataset,
+                        batch_size=train_cfg.micro_batch_size,
+                        drop_last=train_cfg.drop_last,
+                        num_workers=train_cfg.num_workers,
+                        pin_memory=train_cfg.pin_memory)
                     
-    train(model, train_dataloader, val_dataloader, cfg)
+    train(model, train_dataloader, val_dataloader, train_cfg)

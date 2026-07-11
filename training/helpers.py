@@ -7,6 +7,16 @@ from typing import Dict,Any
 from training.training_configs import TrainConfig
 from torch.utils.data import DataLoader
 import shutil
+from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+
+
+
 def build_deepspeed_config(cfg: TrainConfig) -> Dict[str, Any]:
     """
     Build a DeepSpeed configuration from a training configuration.
@@ -88,6 +98,9 @@ def build_deepspeed_config(cfg: TrainConfig) -> Dict[str, Any]:
 
     return ds_config
 
+
+
+
 def has_checkpoint(path):
     """
     Check whether a model checkpoint exists in a directory.
@@ -102,6 +115,9 @@ def has_checkpoint(path):
         os.path.exists(os.path.join(path, "model.safetensors")) or
         os.path.exists(os.path.join(path, "pytorch_model.bin"))
     )
+
+
+
 
 def prepare_checkpoint_from_dataset(cfg: TrainConfig):
     """
@@ -141,6 +157,9 @@ def prepare_checkpoint_from_dataset(cfg: TrainConfig):
     print(f"Checkpoint ready at: {DST_PATH}")
     return DST_PATH
 
+
+
+
 def get_lr(step, cfg: TrainConfig):
     """
     Calculates the learning rate for a specific training step.
@@ -158,6 +177,9 @@ def get_lr(step, cfg: TrainConfig):
         return cfg.lr * step / cfg.warmup_steps
     progress = (step - cfg.warmup_steps) / (cfg.num_train_steps - cfg.warmup_steps)
     return 0.5 * cfg.lr * (1 + math.cos(math.pi * progress))
+
+
+
 
 
 def compute_loss(outputs, targets, cfg: TrainConfig):
@@ -189,6 +211,7 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
 
 
     return loss
+
 
 
 
@@ -248,6 +271,8 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
     model.train()
     return val_loss, val_ppl
     
+
+
 def build_accelerator(cfg: TrainConfig) -> Accelerator:
     """
     Build and configure an Accelerate accelerator.
@@ -270,3 +295,59 @@ def build_accelerator(cfg: TrainConfig) -> Accelerator:
         deepspeed_plugin=ds_plugin,
     )
     return accelerator
+
+
+
+
+
+def collate_fn(batch):
+    """
+    Collate and pad a batch of training samples.
+
+    Args:
+        batch: List of dataset samples.
+
+    Returns:
+        A dictionary containing padded model inputs.
+    """
+    input_ids = [
+        torch.tensor(x["input_ids"], dtype=torch.long)
+        for x in batch
+    ]
+
+    labels = [
+        torch.tensor(x["labels"], dtype=torch.long)
+        for x in batch
+    ]
+
+    position_ids = [
+        torch.tensor(x["position_ids"], dtype=torch.long)
+        for x in batch
+    ]
+
+    input_ids = pad_sequence(
+        input_ids,
+        batch_first=True,
+        padding_value=tokenizer.pad_token_id
+    )
+
+    labels = pad_sequence(
+        labels,
+        batch_first=True,
+        padding_value=-100
+    )
+
+    position_ids = pad_sequence(
+        position_ids,
+        batch_first=True,
+        padding_value=0
+    )
+
+    attention_mask = input_ids != tokenizer.pad_token_id
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+    }

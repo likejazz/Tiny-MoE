@@ -151,6 +151,15 @@ class TrainConfig:
     ep_size                     : Expert parallelism size.
     moe_param_group             : Place MoE parameters into separate optimizer groups.
     use_residual                : Enable residual MoE routing if supported.
+
+    DataLoader
+    ---------
+    drop_last                  : Drop the final incomplete batch for consistent batch sizes.
+    num_workers                : Number of subprocesses used for loading data.
+    prefetch_factor            : Number of batches prefetched by each worker.
+    persistent_workers         : Keep DataLoader workers alive between epochs.
+    pin_memory                 : Pin CPU memory to accelerate host-to-device transfers.
+    
     """
     # Optimization
     lr: float = 2.5e-4
@@ -206,3 +215,10 @@ class TrainConfig:
     ep_size: int = 2
     moe_param_group: bool = True
     use_residual: bool = True
+
+    # DataLoader
+    drop_last: bool = True
+    num_workers: int = 2
+    prefetch_factor: int = 2
+    persistent_workers: bool = True
+    pin_memory:bool = True

@@ -1,10 +1,12 @@
 from dataclasses import dataclass
-from typing import Optional,Literal
+from typing import Literal
+
 from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+
 
 @dataclass
 class ModelConfig:
@@ -59,11 +61,11 @@ class ModelConfig:
     tie_word_embeddings: bool = True
     max_seq_len: int = 2048
     max_batch_size: int = 1
-    
+
     # RMSNorm
     rms_norm_eps: float = 1e-6
-    
-    # RoPE & YaRN 
+
+    # RoPE & YaRN
     rope_theta: float = 10000.0
     rope_type: str = "yarn"
     beta_slow: float = 1.0
@@ -86,6 +88,7 @@ class ModelConfig:
     moe_intermediate_size: int = 1024
     capacity_factor: float = 1.25
 
+
 @dataclass
 class GenerationConfig:
     """
@@ -96,20 +99,22 @@ class GenerationConfig:
     max_new_tokens         : Maximum number of new tokens to generate.
     temperature            : Sampling temperature; lower values produce more deterministic outputs.
     top_k                  : Sample from the top-k most likely tokens.
-    top_p                  : Sample from the smallest set of tokens whose cumulative probability exceeds p.
+    top_p                  : Sample from the smallest set of tokens whose cumulative
+                             probability exceeds p.
     repetition_penalty     : Penalty applied to discourage repeated tokens.
     eos_token_id           : Token that terminates generation.
     pad_token_id           : Token used for padding sequences.
     do_sample              : Whether to use probabilistic sampling instead of greedy decoding.
     use_yarn               : Enable YaRN context extension during generation.
     """
+
     max_new_tokens: int = 50
     temperature: float = 0.5
-    top_k: Optional[int] = 30
-    top_p: Optional[float] = 0.85
+    top_k: int | None = 30
+    top_p: float | None = 0.85
     repetition_penalty: float = 1.25
-    eos_token_id: Optional[int] = tokenizer.eos_token_id
-    pad_token_id: Optional[int] = tokenizer.eos_token_id
+    eos_token_id: int | None = tokenizer.eos_token_id
+    pad_token_id: int | None = tokenizer.eos_token_id
     do_sample: bool = True
     no_repeat_ngram_size: int = 2
-    model_variant : Literal["base","base-yarn","fine-tuned"] = "fine-tuned"
+    model_variant: Literal["base", "base-yarn", "fine-tuned"] = "fine-tuned"

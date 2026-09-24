@@ -1,8 +1,7 @@
-from datasets import load_dataset, interleave_datasets,Dataset
-from torch.utils.data import IterableDataset, get_worker_info
 import torch
 import torch.distributed as dist
-from typing import Optional, Dict, Any, Iterator
+from datasets import interleave_datasets, load_dataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 class Training_Streaming_Dataset(IterableDataset):
@@ -65,8 +64,6 @@ class Training_Streaming_Dataset(IterableDataset):
             split="train",
             streaming=True,
         )
-
-
 
         mixed = interleave_datasets(
             [ds_web, ds_cosmopedia_web, ds_math],
@@ -136,7 +133,7 @@ class Training_Streaming_Dataset(IterableDataset):
                     "labels": torch.tensor(window[1:], dtype=torch.long),
                 }
 
-                token_buffer = token_buffer[self.max_seq_len:]
+                token_buffer = token_buffer[self.max_seq_len :]
 
 
 class Eval_Streaming_Dataset(IterableDataset):
@@ -239,15 +236,19 @@ class Eval_Streaming_Dataset(IterableDataset):
                     "labels": torch.tensor(window[1:], dtype=torch.long),
                 }
 
-                token_buffer = token_buffer[self.max_seq_len:]
-
-
-
-
+                token_buffer = token_buffer[self.max_seq_len :]
 
 
 class BaseFinetuningDataset:
-    def __init__(self, tokenizer, config, dataset_name: str,split = "train",text_field = "conversations",max_sample_length = 1800):
+    def __init__(
+        self,
+        tokenizer,
+        config,
+        dataset_name: str,
+        split="train",
+        text_field="conversations",
+        max_sample_length=1800,
+    ):
         self.tokenizer = tokenizer
         self.max_seq_len = config.max_seq_len
         self.dataset_name = dataset_name
@@ -333,10 +334,7 @@ class BaseFinetuningDataset:
             return None
 
         input_ids = tokens[:-1]
-        labels = [
-            token if keep else -100
-            for token, keep in zip(tokens[1:], loss_mask[1:])
-        ]
+        labels = [token if keep else -100 for token, keep in zip(tokens[1:], loss_mask[1:])]
         position_ids = list(range(len(input_ids)))
 
         return {
@@ -350,7 +348,7 @@ class NoStreamingFinetuningDataset(BaseFinetuningDataset):
     def load(self):
         dataset = load_dataset(
             self.dataset_name,
-            split= self.split,
+            split=self.split,
         )
 
         dataset = dataset.map(
@@ -368,7 +366,6 @@ class NoStreamingFinetuningDataset(BaseFinetuningDataset):
             )
 
         return dataset
-    
 
 
 class StreamingFinetuningDataset(
@@ -418,7 +415,6 @@ class StreamingFinetuningDataset(
 
 
 class FinetuningDataset:
-
     @staticmethod
     def load(
         tokenizer,
@@ -448,7 +444,7 @@ class FinetuningDataset:
                 tokenizer,
                 config,
                 dataset_name,
-                max_sample_length=max_sample_length, 
+                max_sample_length=max_sample_length,
             )
 
         return NoStreamingFinetuningDataset(

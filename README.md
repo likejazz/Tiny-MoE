@@ -28,7 +28,6 @@ Built and trained entirely on Kaggle using 2× NVIDIA T4 GPUs.
   - [Papers](#papers)
   - [Videos](#videos)
 - [Notes](#notes)
-- [About the Author](#about-the-author)
 - [License](#license)
 
 ---
@@ -512,27 +511,6 @@ The project was developed and trained entirely on **Kaggle** using:
 > The primary focus of this project has been implementing and understanding modern LLM architectures and training techniques from scratch, rather than maximizing chat performance.
 >
 > Future updates will include additional instruction tuning, preference optimization, and continued training to improve the model's conversational quality and overall capabilities.
-
-### AI Assistance
-
-To be transparent, AI was used solely as a writing and productivity assistant throughout this project. Since English is not my first language and my formal writing is not always polished, AI helped improve the clarity, readability, and presentation of the documentation. Specifically, it assisted with:
-
-* Documentation
-* README formatting
-* Grammar and wording improvements
-* Naming suggestions
-* General code review and technical explanations
-
-AI was **not** used to generate the implementation of the model, training pipeline, or inference system.
-
-The model architecture, algorithms, debugging process, and engineering decisions were designed, implemented, and validated by me.
-
-
----
-
-## About the Author
-
-Tiny-MoE was created by Abdelrhman Ebied, a 15-year-old developer from Egypt, as a learning project to better understand how modern large language models work internally by implementing their components from scratch instead of relying on existing frameworks.
 
 ---
 

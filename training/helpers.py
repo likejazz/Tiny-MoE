@@ -1,23 +1,23 @@
-import os
 import math
+import os
+import shutil
+from typing import Any
+
 import torch
 import torch.nn.functional as F
-from accelerate import Accelerator,DeepSpeedPlugin
-from typing import Dict,Any
-from training.training_configs import TrainConfig
-from torch.utils.data import DataLoader
-import shutil
+from accelerate import Accelerator, DeepSpeedPlugin
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+
+from training.training_configs import TrainConfig
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 
-
-
-def build_deepspeed_config(cfg: TrainConfig) -> Dict[str, Any]:
+def build_deepspeed_config(cfg: TrainConfig) -> dict[str, Any]:
     """
     Build a DeepSpeed configuration from a training configuration.
 
@@ -27,39 +27,43 @@ def build_deepspeed_config(cfg: TrainConfig) -> Dict[str, Any]:
     Returns:
         A DeepSpeed configuration dictionary.
     """
-    zero_config: Dict[str, Any] = {
+    zero_config: dict[str, Any] = {
         "stage": cfg.zero_stage,
         "overlap_comm": cfg.overlap_comm,
         "contiguous_gradients": cfg.contiguous_gradients,
         "reduce_bucket_size": cfg.reduce_bucket_size,
     }
 
-
     if cfg.zero_stage == 1:
-        zero_config.update({
-            "reduce_scatter": True,
-        })
+        zero_config.update(
+            {
+                "reduce_scatter": True,
+            }
+        )
 
     elif cfg.zero_stage == 2:
-        zero_config.update({
-            "allgather_partitions": True,
-            "allgather_bucket_size": cfg.reduce_bucket_size,
-        })
+        zero_config.update(
+            {
+                "allgather_partitions": True,
+                "allgather_bucket_size": cfg.reduce_bucket_size,
+            }
+        )
 
     elif cfg.zero_stage == 3:
-        zero_config.update({
-            "stage3_prefetch_bucket_size": cfg.reduce_bucket_size // 2,
-            "stage3_param_persistence_threshold": 1_000_000,
-        })
+        zero_config.update(
+            {
+                "stage3_prefetch_bucket_size": cfg.reduce_bucket_size // 2,
+                "stage3_param_persistence_threshold": 1_000_000,
+            }
+        )
 
         if cfg.offload_param:
             zero_config["offload_param"] = {"device": "cpu", "pin_memory": True}
 
-
     if cfg.zero_stage >= 2 and cfg.offload_optimizer:
         zero_config["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
 
-    ds_config: Dict[str, Any] = {
+    ds_config: dict[str, Any] = {
         "train_micro_batch_size_per_gpu": cfg.micro_batch_size,
         "gradient_accumulation_steps": cfg.grad_accum_steps,
         "gradient_clipping": cfg.grad_clip,
@@ -99,8 +103,6 @@ def build_deepspeed_config(cfg: TrainConfig) -> Dict[str, Any]:
     return ds_config
 
 
-
-
 def has_checkpoint(path):
     """
     Check whether a model checkpoint exists in a directory.
@@ -111,17 +113,15 @@ def has_checkpoint(path):
     Returns:
         True if a supported checkpoint file exists, otherwise False.
     """
-    return (
-        os.path.exists(os.path.join(path, "model.safetensors")) or
-        os.path.exists(os.path.join(path, "pytorch_model.bin"))
+    return os.path.exists(os.path.join(path, "model.safetensors")) or os.path.exists(
+        os.path.join(path, "pytorch_model.bin")
     )
-
-
 
 
 def prepare_checkpoint_from_dataset(cfg: TrainConfig):
     """
-    Finds and copies the latest model checkpoint from a read-only dataset to the local working directory.
+    Finds and copies the latest model checkpoint from a read-only dataset to the local
+    working directory.
 
     Args:
         cfg (TrainConfig): Configuration object containing 'out_dir'.
@@ -158,15 +158,13 @@ def prepare_checkpoint_from_dataset(cfg: TrainConfig):
     return DST_PATH
 
 
-
-
 def get_lr(step, cfg: TrainConfig):
     """
     Calculates the learning rate for a specific training step.
 
     Args:
         step (int): The current training step/iteration.
-        cfg (TrainConfig): Configuration object containing 'lr', 'warmup_steps', 
+        cfg (TrainConfig): Configuration object containing 'lr', 'warmup_steps',
                           and 'num_train_steps'.
 
     Returns:
@@ -179,18 +177,15 @@ def get_lr(step, cfg: TrainConfig):
     return 0.5 * cfg.lr * (1 + math.cos(math.pi * progress))
 
 
-
-
-
 def compute_loss(outputs, targets, cfg: TrainConfig):
     """
     Computes the cross-entropy loss with MoE stabilization penalties.
 
     Args:
-        outputs (dict): Model output dictionary containing 'logits' [B, T, V], 
+        outputs (dict): Model output dictionary containing 'logits' [B, T, V],
                         and optional 'aux_loss' and 'z_loss' tensors.
         targets (torch.Tensor): Ground truth token IDs of shape [B, T].
-        cfg (TrainConfig): Config object with 'router_aux_loss_coef' and 
+        cfg (TrainConfig): Config object with 'router_aux_loss_coef' and
                           'router_z_loss_coef' scaling factors.
 
     Returns:
@@ -199,7 +194,6 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
     logits = outputs["logits"]
     aux_loss = outputs.get("aux_loss", 0.0)
     z_loss = outputs.get("z_loss", 0.0)
-    
 
     loss = F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
@@ -209,10 +203,7 @@ def compute_loss(outputs, targets, cfg: TrainConfig):
 
     loss = loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss)
 
-
     return loss
-
-
 
 
 def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
@@ -232,32 +223,32 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
     model.eval()
     model = accelerator.unwrap_model(model)
     data_iter = iter(val_dataloader)
-    
+
     device = accelerator.device
     local_loss_sum = torch.tensor(0.0, device=device)
     local_count = torch.tensor(0.0, device=device)
-    
+
     with torch.inference_mode():
-   
         for step, batch in enumerate(data_iter):
             if step >= cfg.num_eval_steps:
                 break
 
-    
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = batch.get("labels", input_ids).to(device, non_blocking=True)
 
-     
             if "position_ids" in batch:
                 position_ids = batch["position_ids"].to(device, non_blocking=True)
             else:
- 
                 batch_size, seq_len = input_ids.shape
-                position_ids = torch.arange(seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size, -1)
-                
+                position_ids = (
+                    torch.arange(seq_len, device=accelerator.device)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                )
+
             outputs = model(input_ids, position_ids=position_ids)
             loss = compute_loss(outputs, labels, cfg)
-            
+
             batch_size = input_ids.size(0)
             local_loss_sum += loss.detach() * batch_size
             local_count += batch_size
@@ -270,7 +261,6 @@ def evaluate(model, val_dataloader: DataLoader, cfg: TrainConfig, accelerator):
 
     model.train()
     return val_loss, val_ppl
-    
 
 
 def build_accelerator(cfg: TrainConfig) -> Accelerator:
@@ -297,9 +287,6 @@ def build_accelerator(cfg: TrainConfig) -> Accelerator:
     return accelerator
 
 
-
-
-
 def collate_fn(batch):
     """
     Collate and pad a batch of training samples.
@@ -310,38 +297,17 @@ def collate_fn(batch):
     Returns:
         A dictionary containing padded model inputs.
     """
-    input_ids = [
-        torch.tensor(x["input_ids"], dtype=torch.long)
-        for x in batch
-    ]
+    input_ids = [torch.tensor(x["input_ids"], dtype=torch.long) for x in batch]
 
-    labels = [
-        torch.tensor(x["labels"], dtype=torch.long)
-        for x in batch
-    ]
+    labels = [torch.tensor(x["labels"], dtype=torch.long) for x in batch]
 
-    position_ids = [
-        torch.tensor(x["position_ids"], dtype=torch.long)
-        for x in batch
-    ]
+    position_ids = [torch.tensor(x["position_ids"], dtype=torch.long) for x in batch]
 
-    input_ids = pad_sequence(
-        input_ids,
-        batch_first=True,
-        padding_value=tokenizer.pad_token_id
-    )
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
 
-    labels = pad_sequence(
-        labels,
-        batch_first=True,
-        padding_value=-100
-    )
+    labels = pad_sequence(labels, batch_first=True, padding_value=-100)
 
-    position_ids = pad_sequence(
-        position_ids,
-        batch_first=True,
-        padding_value=0
-    )
+    position_ids = pad_sequence(position_ids, batch_first=True, padding_value=0)
 
     attention_mask = input_ids != tokenizer.pad_token_id
 

@@ -1,8 +1,7 @@
 import torch
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict, Set, List
-from inference.inference_configs import GenerationConfig
 
+from inference.inference_configs import GenerationConfig
 
 
 def _prepare_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
@@ -32,7 +31,7 @@ def _apply_repetition_penalty(
     logits: torch.Tensor,
     prev_tokens: torch.Tensor,
     penalty: float,
-    ignore_token_ids: Optional[Tuple[int, ...]] = None,
+    ignore_token_ids: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """
     Apply a repetition penalty to previously generated tokens.
@@ -68,7 +67,6 @@ def _apply_repetition_penalty(
         tokens = torch.unique(tokens)
         token_logits = out[b, tokens]
 
- 
         token_logits = torch.where(
             token_logits < 0,
             token_logits * penalty,
@@ -79,7 +77,7 @@ def _apply_repetition_penalty(
     return out
 
 
-def _apply_top_k(logits: torch.Tensor, k: Optional[int]) -> torch.Tensor:
+def _apply_top_k(logits: torch.Tensor, k: int | None) -> torch.Tensor:
     """
     Apply top-k filtering to logits.
 
@@ -102,7 +100,7 @@ def _apply_top_k(logits: torch.Tensor, k: Optional[int]) -> torch.Tensor:
     return logits.masked_fill(logits < kth_values, float("-inf"))
 
 
-def _apply_top_p(logits: torch.Tensor, p: Optional[float]) -> torch.Tensor:
+def _apply_top_p(logits: torch.Tensor, p: float | None) -> torch.Tensor:
     """
     Apply top-p (nucleus) filtering to logits.
 
@@ -186,15 +184,14 @@ def _apply_no_repeat_ngram(
         if len(history) < ngram_size - 1:
             continue
 
-
-        banned: Dict[Tuple[int, ...], Set[int]] = {}
+        banned: dict[tuple[int, ...], set[int]] = {}
 
         for i in range(len(history) - ngram_size + 1):
             prefix = tuple(history[i : i + ngram_size - 1])
             next_token = history[i + ngram_size - 1]
             banned.setdefault(prefix, set()).add(next_token)
 
-        current_prefix = tuple(history[-(ngram_size - 1):])
+        current_prefix = tuple(history[-(ngram_size - 1) :])
         blocked_tokens = banned.get(current_prefix)
 
         if blocked_tokens:
@@ -207,11 +204,12 @@ def _apply_no_repeat_ngram(
 
     return logits
 
+
 def filter_logits(
     logits: torch.Tensor,
     cfg: GenerationConfig,
-    prev_tokens: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    prev_tokens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Filter logits and select the next token.
     """
@@ -222,9 +220,7 @@ def filter_logits(
         and cfg.repetition_penalty > 1.0
         and prev_tokens is not None
     ):
-        ignore_ids = tuple(
-            x for x in (cfg.eos_token_id, cfg.pad_token_id) if x is not None
-        )
+        ignore_ids = tuple(x for x in (cfg.eos_token_id, cfg.pad_token_id) if x is not None)
         logits = _apply_repetition_penalty(
             logits,
             prev_tokens=prev_tokens,

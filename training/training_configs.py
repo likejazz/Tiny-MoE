@@ -1,5 +1,7 @@
 from dataclasses import dataclass
-from typing import Tuple, Literal
+from typing import Literal
+
+
 @dataclass
 class ModelConfig:
     """
@@ -46,19 +48,21 @@ class ModelConfig:
     num_experts             : Number of feed-forward experts in each MoE layer.
     num_experts_per_token   : Number of experts selected for each token.
     moe_intermediate_size   : Hidden dimension of each expert's feed-forward network.
-    capacity_factor         : Capacity multiplier controlling the maximum tokens assigned to each expert.
+    capacity_factor         : Capacity multiplier controlling the maximum tokens
+                              assigned to each expert.
     """
+
     vocab_size: int = 32000
     hidden_size: int = 512
     num_layers: int = 14
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
     max_seq_len: int = 512
-    
+
     # RMSNorm
     rms_norm_eps: float = 1e-6
-    
-    # RoPE & YaRN 
+
+    # RoPE & YaRN
     rope_theta: float = 10000.0
     rope_type: str = "default"
     beta_slow: float = 1.0
@@ -101,7 +105,8 @@ class TrainConfig:
 
     Batch / Throughput
     ------------------
-    micro_batch_size            : Number of samples processed per device before gradient accumulation.
+    micro_batch_size            : Number of samples processed per device before
+                                  gradient accumulation.
     grad_accum_steps            : Number of gradient accumulation steps.
     max_seq_len                 : Sequence length used during training.
 
@@ -159,41 +164,44 @@ class TrainConfig:
     prefetch_factor            : Number of batches prefetched by each worker.
     persistent_workers         : Keep DataLoader workers alive between epochs.
     pin_memory                 : Pin CPU memory to accelerate host-to-device transfers.
-    
+
     """
+
     # Optimization
     lr: float = 2.5e-4
     weight_decay: float = 0.1
-    betas: Tuple[float, float] = (0.9, 0.95)
+    betas: tuple[float, float] = (0.9, 0.95)
     grad_clip: float = 1.0
     num_train_steps: int = 30000
     warmup_steps: int = 2800
     optimizer_type: Literal["AdamW", "PagedAdamW", "8bitAdamW"] = "8bitAdamW"
-    
+
     # Batch / Throughput
     micro_batch_size: int = 64
     grad_accum_steps: int = 4
     max_seq_len: int = 512
-    
+
     # Precision / Performance
     mixed_precision: Literal["no", "fp16", "bf16"] = "fp16"
-    
+
     # Memory
     activation_checkpointing: bool = True
-    compile_model: bool = True          
-    compile_mode: Literal["default", "reduce-overhead", "max-autotune","max-autotune-no-cudagraphs"] = "max-autotune-no-cudagraphs"
-    
+    compile_model: bool = True
+    compile_mode: Literal[
+        "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"
+    ] = "max-autotune-no-cudagraphs"
+
     # MoE Stability
     router_aux_loss_coef: float = 1e-2
     router_z_loss_coef: float = 1e-3
-    
+
     # Logging
     save_interval: int = 600
     num_eval_steps: int = 50
     eval_interval: int = 1000
     log_interval: int = 5
     out_dir: str = "/kaggle/working/checkpoints"
-    
+
     # DeepSpeed
     deepspeed_enabled: bool = True
     wall_clock_breakdown: bool = False
@@ -221,4 +229,4 @@ class TrainConfig:
     num_workers: int = 2
     prefetch_factor: int = 2
     persistent_workers: bool = True
-    pin_memory:bool = True
+    pin_memory: bool = True

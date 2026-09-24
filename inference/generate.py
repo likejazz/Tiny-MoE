@@ -1,21 +1,18 @@
-from typing import Generator,Optional
-from inference.inference_configs import GenerationConfig
+from collections.abc import Generator
+
 import torch
 from transformers import AutoTokenizer
-from inference.sampler import _normalize_logits,_prepare_input_ids,filter_logits
+
+from inference.inference_configs import GenerationConfig
 from inference.load_model import load_and_prepare_model
-
-
-
-
-
+from inference.sampler import _normalize_logits, _prepare_input_ids, filter_logits
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 
-def build_inference_prompt(user_prompt: str, system_prompt: Optional[str] = None) -> str:
+def build_inference_prompt(user_prompt: str, system_prompt: str | None = None) -> str:
     parts = []
 
     if system_prompt is not None:
@@ -81,7 +78,7 @@ def _generate_tokens(
         cur_len += 1
 
         if cfg.eos_token_id is not None:
-            finished |= (next_token == cfg.eos_token_id)
+            finished |= next_token == cfg.eos_token_id
 
         yield next_token
 
@@ -104,7 +101,7 @@ def run_prompt(
     tokenizer,
     cfg: GenerationConfig,
     device: str = "cuda",
-    system_prompt: Optional[str] = None,
+    system_prompt: str | None = None,
 ) -> None:
     model.eval()
 
@@ -143,7 +140,7 @@ def run_prompt(
                 new_text = _decode_tokens(tokenizer, generated_ids[0].tolist())
 
                 if new_text.startswith(prev_text):
-                    suffix = new_text[len(prev_text):]
+                    suffix = new_text[len(prev_text) :]
                 else:
                     lcp = 0
                     limit = min(len(prev_text), len(new_text))
@@ -158,9 +155,6 @@ def run_prompt(
         print()
 
 
-
-
-
 def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = GenerationConfig(
@@ -169,13 +163,13 @@ def main() -> None:
         top_k=None,
         repetition_penalty=1.2,
         no_repeat_ngram_size=3,
-        max_new_tokens=50,   
+        max_new_tokens=50,
         do_sample=False,
-        model_variant="base"
+        model_variant="base",
     )
-    model = load_and_prepare_model(cfg,device)
+    model = load_and_prepare_model(cfg, device)
     system_prompt = "You Are a helpful Ai Assistant."
-    run_prompt(model, tokenizer, cfg, device=device,system_prompt=system_prompt)
+    run_prompt(model, tokenizer, cfg, device=device, system_prompt=system_prompt)
 
 
 if __name__ == "__main__":

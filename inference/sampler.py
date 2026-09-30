@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-
 from inference_configs import GenerationConfig
 
 

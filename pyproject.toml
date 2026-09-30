@@ -16,10 +16,6 @@ dependencies = [
     "tqdm==4.70.1",
     "wandb==0.30.0",
     "huggingface_hub==1.33.0",
-]
-
-[dependency-groups]
-dev = [
     "ruff==0.16.9",
 ]
 

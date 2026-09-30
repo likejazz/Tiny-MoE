@@ -76,7 +76,7 @@ Tiny-MoE/
 │   ├── generate.py                  # Entry point for text generation.
 │   ├── inference_configs.py         # Model and generation configurations.
 │   ├── load_model.py                # Downloads and loads Hugging Face checkpoints.
-│   ├── model_inference.py           # Model architecture used for inference.
+│   ├── modeling.py                  # Model architecture used for inference.
 │   └── sampler.py                   # Sampling strategies (Top-k, Top-p, temperature, etc.).
 ├── .github/workflows/lint.yml       # Ruff lint and format checks.
 ├── .gitignore

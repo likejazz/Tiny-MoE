@@ -83,7 +83,6 @@ Tiny-MoE/
 ├── LICENSE
 ├── pyproject.toml
 ├── README.md
-├── requirements.txt                 # Dependencies for inference and text generation.
 └── uv.lock
 ```
 

@@ -6,16 +6,16 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
-    "torch",
-    "accelerate",
-    "deepspeed",
-    "transformers",
-    "datasets",
-    "bitsandbytes",
-    "safetensors",
-    "tqdm",
-    "wandb",
-    "huggingface_hub",
+    "torch==2.14.0",
+    "accelerate==1.15.0",
+    "deepspeed==0.19.7",
+    "transformers==5.17.0",
+    "datasets==5.0.1",
+    "bitsandbytes==0.50.2",
+    "safetensors==0.8.0",
+    "tqdm==4.70.1",
+    "wandb==0.30.0",
+    "huggingface_hub==1.33.0",
 ]
 
 [dependency-groups]

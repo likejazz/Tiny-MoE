@@ -3,9 +3,9 @@ from collections.abc import Generator
 import torch
 from transformers import AutoTokenizer
 
-from inference.inference_configs import GenerationConfig
-from inference.load_model import load_and_prepare_model
-from inference.sampler import _normalize_logits, _prepare_input_ids, filter_logits
+from inference_configs import GenerationConfig
+from load_model import load_and_prepare_model
+from sampler import _normalize_logits, _prepare_input_ids, filter_logits
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 if tokenizer.pad_token is None:

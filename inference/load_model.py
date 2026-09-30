@@ -2,8 +2,8 @@ import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
-from inference.inference_configs import GenerationConfig, ModelConfig
-from inference.model_inference import Transformer
+from inference_configs import GenerationConfig, ModelConfig
+from model_inference import Transformer
 
 
 def load_and_prepare_model(cfg: GenerationConfig, device: torch.device):

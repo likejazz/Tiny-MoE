@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from inference.inference_configs import GenerationConfig
+from inference_configs import GenerationConfig
 
 
 def _prepare_input_ids(input_ids: torch.Tensor) -> torch.Tensor:

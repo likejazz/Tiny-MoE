@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from inference.inference_configs import ModelConfig
+from inference_configs import ModelConfig
 
 try:
     from flash_attn import flash_attn_func

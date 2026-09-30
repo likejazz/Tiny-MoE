@@ -53,7 +53,7 @@ cd Tiny-MoE
 ### 2. Install
 
 ```bash
-pip install -r requirements-inference.txt
+pip install -r requirements.txt
 ```
 
 ### 3. Generate
@@ -83,7 +83,7 @@ Tiny-MoE/
 ├── LICENSE
 ├── pyproject.toml
 ├── README.md
-├── requirements-inference.txt       # Dependencies for inference and text generation.
+├── requirements.txt                 # Dependencies for inference and text generation.
 └── uv.lock
 ```
 

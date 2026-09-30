@@ -78,7 +78,6 @@ Tiny-MoE/
 │   ├── load_model.py                # Downloads and loads Hugging Face checkpoints.
 │   ├── modeling.py                  # Model architecture used for inference.
 │   └── sampler.py                   # Sampling strategies (Top-k, Top-p, temperature, etc.).
-├── .github/workflows/lint.yml       # Ruff lint and format checks.
 ├── .gitignore
 ├── LICENSE
 ├── pyproject.toml
